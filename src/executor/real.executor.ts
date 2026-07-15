@@ -20,6 +20,12 @@ import { quoteBuy, type PairState } from './uniswap-math.js'
 
 const log = createChildLogger('real-executor')
 
+// Telegram alert throttle for failing sells — the PM retries on every Sync
+// push, so an unfillable exit would otherwise flood the chat. One alert per
+// position per interval is enough for a human to act.
+const SELL_FAIL_ALERT_INTERVAL_MS = 60_000
+const lastSellFailAlertAt = new Map<string, number>()
+
 // ── Contract ABIs ────────────────────────────────────────────────────────────
 
 const ERC20_ABI = [
@@ -43,6 +49,15 @@ const UNISWAP_V2_ROUTER_ABI = [
 const MIN_ETH_RESERVE = 0.005 // 0.005 ETH for gas
 /** Timeout for tx confirmation (ms). */
 const CONFIRM_TIMEOUT_MS = 60_000
+/**
+ * After CONFIRM_TIMEOUT_MS, the tx may STILL land (congestion). Re-check the
+ * receipt before declaring failure — a buy that lands after a premature "fail"
+ * leaves orphan tokens with no position row (no TP/SL/dev monitoring), and a
+ * sell that lands after a premature "fail" strands the position in a
+ * zero-balance retry loop.
+ */
+const RECEIPT_RECHECK_ATTEMPTS = 4
+const RECEIPT_RECHECK_INTERVAL_MS = 15_000
 /** Default deadline for swap transactions (seconds from now). */
 const DEFAULT_DEADLINE_SECONDS = 60
 /** Gas limit for simple ERC-20 approve calls. */
@@ -54,8 +69,6 @@ const MAX_SELL_RETRIES = 3
 const SELL_RETRY_BACKOFF_MS = [500, 1_000, 2_000]
 /** Escalating priority fees per retry (gwei). Index 0 = first send. */
 const SELL_PRIORITY_FEES_GWEI = [2n, 5n, 10n]
-/** Slippage tolerance for Uniswap sells (percent). */
-const UNISWAP_SELL_SLIPPAGE_PCT = 3
 
 export type SellReason =
   | 'take-profit'
@@ -63,6 +76,22 @@ export type SellReason =
   | 'manual'
   | 'shutdown'
   | 'stale-flat'
+  | 'dev-sell' // deployer dumped — emergency abandon
+
+/**
+ * Sell slippage tolerance (percent) per exit reason. Emergency exits accept
+ * whatever the pool gives: with a fixed tight tolerance, every attempt during
+ * a dump reverts (price falls faster than quote→inclusion) while the pool
+ * drains — exactly when the exit matters most.
+ */
+const SELL_SLIPPAGE_PCT_BY_REASON: Record<SellReason, number> = {
+  'take-profit': 3,
+  manual: 3,
+  shutdown: 10,
+  'stale-flat': 10,
+  'stop-loss': 25,
+  'dev-sell': 50,
+}
 
 export interface RealSellRequest {
   position: Position
@@ -80,6 +109,9 @@ export interface RealSellRequest {
 function isRetryableTxError(err: unknown): boolean {
   if (err instanceof Error) {
     const msg = err.message.toLowerCase()
+    // A slippage revert IS retryable in the sell loop: every attempt re-quotes
+    // getAmountsOut, so the next minOut tracks the price that just moved.
+    if (msg.includes('reverted')) return true
     if (msg.includes('timeout')) return true
     if (msg.includes('timed out')) return true
     if (msg.includes('econnrefused')) return true
@@ -105,24 +137,49 @@ async function waitForConfirmation(
   tx: TransactionResponse,
   label: string,
 ): Promise<TransactionReceipt> {
-  const receipt = await Promise.race([
-    tx.wait(1),
-    new Promise<null>((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`${label}: confirmation timed out after ${CONFIRM_TIMEOUT_MS}ms`)),
-        CONFIRM_TIMEOUT_MS,
-      ),
-    ),
-  ])
+  let timer: NodeJS.Timeout | undefined
+  // The rejection handler is attached BEFORE the race: if the timeout wins,
+  // a late tx.wait() rejection already has a handler and can never become a
+  // fatal unhandledRejection (main.ts shuts the whole bot down on those).
+  const waitP: Promise<TransactionReceipt | null | Error> = tx
+    .wait(1)
+    .catch((err: Error) => err)
+  const timeoutP = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), CONFIRM_TIMEOUT_MS)
+  })
 
-  if (!receipt || receipt.status === null) {
-    throw new Error(`${label}: no receipt returned`)
-  }
-  if (receipt.status === 0) {
-    throw new Error(`${label}: transaction reverted (status=0)`)
-  }
+  try {
+    const first = await Promise.race([waitP, timeoutP])
 
-  return receipt
+    if (first !== 'timeout') {
+      if (first instanceof Error) throw new Error(`${label}: ${first.message}`)
+      if (!first || first.status === null) throw new Error(`${label}: no receipt returned`)
+      if (first.status === 0) throw new Error(`${label}: transaction reverted (status=0)`)
+      return first
+    }
+
+    // Timeout is NOT failure — the tx may land later. Poll the receipt before
+    // giving up so a late inclusion is recorded instead of orphaned.
+    for (let i = 0; i < RECEIPT_RECHECK_ATTEMPTS; i++) {
+      await new Promise((r) => setTimeout(r, RECEIPT_RECHECK_INTERVAL_MS))
+      const receipt = await rhProvider.getTransactionReceipt(tx.hash).catch(() => null)
+      if (receipt) {
+        if (receipt.status === 0) throw new Error(`${label}: transaction reverted (status=0)`)
+        log.warn(
+          { label, txHash: tx.hash, recheck: i + 1 },
+          'Tx confirmed on receipt re-check after timeout',
+        )
+        return receipt
+      }
+    }
+    throw new Error(
+      `${label}: confirmation timed out after ${CONFIRM_TIMEOUT_MS}ms + ` +
+        `${RECEIPT_RECHECK_ATTEMPTS} re-checks — VERIFY ON-CHAIN before assuming ` +
+        `failure (hash ${tx.hash})`,
+    )
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /**
@@ -205,6 +262,17 @@ export class RealExecutor implements BaseExecutor {
 
       if (quote.tokensOut <= 0) {
         return this.fail(startedAt, `quoteBuy returned zero tokensOut`)
+      }
+
+      // Slippage gate — reject if our own price impact exceeds the signal
+      // tolerance. The router's minTokensOut below is derived from this quote
+      // (self-impact already included), so it can never catch this case.
+      const slippageTolPct = signal.slippageBps / 100
+      if (quote.priceImpactPct > slippageTolPct) {
+        return this.fail(
+          startedAt,
+          `price impact ${quote.priceImpactPct.toFixed(2)}% > tolerance ${slippageTolPct.toFixed(2)}%`,
+        )
       }
 
       // 3. Build + send Uniswap V2 buy tx via Router02
@@ -423,12 +491,12 @@ export class RealExecutor implements BaseExecutor {
       : BigInt(req.position.tokensReceived ?? '0')
 
     if (totalTokensRaw === 0n) {
-      return this.failSell(startedAt, 'no tokens to sell')
+      return this.failSell(startedAt, 'no tokens to sell', req.position)
     }
 
     const wallet = getBotWallet()
     if (!wallet) {
-      return this.failSell(startedAt, 'no wallet configured')
+      return this.failSell(startedAt, 'no wallet configured', req.position)
     }
 
     let tokensToSellRaw = (totalTokensRaw * BigInt(Math.round(req.sellPctOfPosition))) / 100n
@@ -444,6 +512,7 @@ export class RealExecutor implements BaseExecutor {
         return this.failSell(
           startedAt,
           'wallet holds zero tokens for this position — manual reconciliation required',
+          req.position,
         )
       }
       if (req.sellPctOfPosition >= 100) {
@@ -481,7 +550,7 @@ export class RealExecutor implements BaseExecutor {
     try {
       outcome = await this.sellViaUniswap(req, tokensToSellRaw)
     } catch (err) {
-      return this.failSell(startedAt, (err as Error).message)
+      return this.failSell(startedAt, (err as Error).message, req.position)
     }
 
     // ── Update DB ─────────────────────────────────────────────────────────
@@ -619,8 +688,9 @@ export class RealExecutor implements BaseExecutor {
         // Get quote from router
         const amountsOut: bigint[] = await router.getAmountsOut!(tokensToSellRaw, path)
         const expectedEthOutWei = amountsOut[amountsOut.length - 1]!
-        // Apply slippage tolerance
-        const minEthOutWei = (expectedEthOutWei * BigInt(100 - UNISWAP_SELL_SLIPPAGE_PCT)) / 100n
+        // Apply slippage tolerance scaled by exit urgency
+        const slippagePct = SELL_SLIPPAGE_PCT_BY_REASON[req.reason]
+        const minEthOutWei = (expectedEthOutWei * BigInt(100 - slippagePct)) / 100n
 
         // Build tx overrides with escalating priority fees
         const txOverrides: Record<string, unknown> = {
@@ -743,9 +813,26 @@ export class RealExecutor implements BaseExecutor {
     return { success: false, positionId: null, outputAmount: '0', executionPrice: 0, realizedSlippagePct: 0, txSignature: '', durationMs: Date.now() - startedAt, error: reason }
   }
 
-  private failSell(startedAt: number, reason: string): ExecutionResult {
-    log.warn({ reason }, 'REAL sell aborted')
-    return { success: false, positionId: null, outputAmount: '0', executionPrice: 0, realizedSlippagePct: 0, txSignature: '', durationMs: Date.now() - startedAt, error: reason }
+  /**
+   * When `position` is provided the failure is one where money is at risk
+   * (exit not filling) and a throttled Telegram alert is fired; guard-style
+   * no-ops (already closed, partial too small) omit it to avoid noise.
+   */
+  private failSell(startedAt: number, reason: string, position?: Position): ExecutionResult {
+    log.warn({ reason, positionId: position?.id }, 'REAL sell aborted')
+    if (position) {
+      const last = lastSellFailAlertAt.get(position.id) ?? 0
+      if (Date.now() - last >= SELL_FAIL_ALERT_INTERVAL_MS) {
+        lastSellFailAlertAt.set(position.id, Date.now())
+        void sendTelegramAlert(
+          `⚠️ <b>VENDA REAL FALHOU</b> — ${position.tokenSymbol ?? position.tokenAddress.slice(0, 10)}\n\n` +
+            `Motivo: <code>${reason}</code>\n` +
+            `Pos: <code>${position.id}</code>\n\n` +
+            `O PositionManager vai re-tentar; verifique a posição on-chain.`,
+        )
+      }
+    }
+    return { success: false, positionId: position?.id ?? null, outputAmount: '0', executionPrice: 0, realizedSlippagePct: 0, txSignature: '', durationMs: Date.now() - startedAt, error: reason }
   }
 }
 
