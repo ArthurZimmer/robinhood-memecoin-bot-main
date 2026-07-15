@@ -82,6 +82,10 @@ export interface LivePositionSnapshot {
   entryPriceNative: number
   spotPriceNative: number
   pnlPct: number
+  // Raw reserves at snapshot time — lets the dashboard quote an executable
+  // exit (impact + fee included) instead of marking at mid-price.
+  ethReserve: number
+  tokenReserve: number
   fetchedAt: number
 }
 
@@ -111,9 +115,13 @@ export class PositionManager {
     this.staleKillAgeMs = options.staleKillAgeMs ?? 90_000
     this.staleEthReserveToleranceNative = options.staleEthReserveToleranceNative ?? 0.005
 
-    // Dev wallet monitor callback — bridges the monitor back into the sell path
+    // Dev wallet monitor callback — bridges the monitor back into the sell path.
+    // .catch: a throwing emergency sell must never become a fatal
+    // unhandledRejection — that would take down TP/SL for every position.
     const onDevDump: DevDumpCallback = (positionId, _devAddress, _soldPct) => {
-      void this.handleDevDump(positionId)
+      this.handleDevDump(positionId).catch((err) => {
+        log.error({ err, positionId }, 'Dev dump emergency sell failed')
+      })
     }
     this.devWalletMonitor = new DevWalletMonitor(onDevDump)
   }
@@ -403,6 +411,8 @@ export class PositionManager {
       entryPriceNative: entryPrice,
       spotPriceNative: spotPrice,
       pnlPct,
+      ethReserve: pair.ethReserve,
+      tokenReserve: pair.tokenReserve,
       fetchedAt: Date.now(),
     })
 
@@ -450,27 +460,13 @@ export class PositionManager {
       const fetched = await this.fetchPairState(position)
       if (!fetched) {
         log.warn({ positionId }, 'Dev dump: pair state unavailable, using entry snapshot as fallback')
-        const meta = position.metadata as
-          | { pairReservesSnapshot?: { ethReserve?: number; tokenReserve?: number } }
-          | null
-        pair = {
-          ethReserve: meta?.pairReservesSnapshot?.ethReserve ?? 0,
-          tokenReserve: meta?.pairReservesSnapshot?.tokenReserve ?? 0,
-          tokenDecimals: 18,
-        }
+        pair = this.pairStateFromEntrySnapshot(position)
       } else {
         pair = fetched
       }
     } catch (err) {
       log.error({ err, positionId }, 'Dev dump: failed to fetch pair state, using entry snapshot')
-      const meta = position.metadata as
-        | { pairReservesSnapshot?: { ethReserve?: number; tokenReserve?: number } }
-        | null
-      pair = {
-        ethReserve: meta?.pairReservesSnapshot?.ethReserve ?? 0,
-        tokenReserve: meta?.pairReservesSnapshot?.tokenReserve ?? 0,
-        tokenDecimals: 18,
-      }
+      pair = this.pairStateFromEntrySnapshot(position)
     }
 
     log.info(
@@ -545,12 +541,24 @@ export class PositionManager {
     if (position.status === 'closed' || position.status === 'stopped') return
     this.inflight.add(position.id)
     try {
-      const result = await executorSell({
-        position,
-        sellPctOfPosition: sellPct,
-        reason,
-        currentState,
-      })
+      let result: Awaited<ReturnType<typeof executorSell>>
+      try {
+        result = await executorSell({
+          position,
+          sellPctOfPosition: sellPct,
+          reason,
+          currentState,
+        })
+      } catch (err) {
+        // A throwing executor must not propagate — callers like the dev-dump
+        // callback and Sync push handlers would turn it into a lost sell or a
+        // fatal rejection. The position stays open; the next push/sweep retries.
+        log.error(
+          { err, positionId: position.id, reason, sellPct },
+          'Executor sell threw — will retry on next evaluation',
+        )
+        return
+      }
 
       if (result.success) {
         log.info(
@@ -605,6 +613,21 @@ export class PositionManager {
     }
 
     return null
+  }
+
+  /** Entry-time reserves snapshot as a PairState — last-resort fill state. */
+  private pairStateFromEntrySnapshot(position: Position): PairState {
+    const meta = position.metadata as
+      | {
+          pairReservesSnapshot?: { ethReserve?: number; tokenReserve?: number }
+          tokenDecimals?: number
+        }
+      | null
+    return {
+      ethReserve: meta?.pairReservesSnapshot?.ethReserve ?? 0,
+      tokenReserve: meta?.pairReservesSnapshot?.tokenReserve ?? 0,
+      tokenDecimals: meta?.tokenDecimals ?? 18,
+    }
   }
 
   /**

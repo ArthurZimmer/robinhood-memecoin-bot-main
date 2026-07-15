@@ -26,6 +26,54 @@ const log = createChildLogger('real-executor')
 const SELL_FAIL_ALERT_INTERVAL_MS = 60_000
 const lastSellFailAlertAt = new Map<string, number>()
 
+// Serialize wallet tx sends — concurrent sends (buy, sell, approve) from the
+// same wallet race nonce allocation and fail with nonce/replacement errors.
+// Only the send is serialized; confirmation waits happen outside the lock.
+let txSendChain: Promise<unknown> = Promise.resolve()
+function withTxLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = txSendChain.then(fn, fn)
+  txSendChain = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
+
+// Grace-poll window for token arrival after an ambiguous buy failure.
+const TOKEN_ARRIVAL_CHECKS = 3
+const TOKEN_ARRIVAL_INTERVAL_MS = 10_000
+
+/**
+ * Persist a DB write that follows a CONFIRMED on-chain tx. The money already
+ * moved — losing the write orphans real funds (tokens without TP/SL, or a
+ * ghost-open position). Retry briefly, then page the operator with everything
+ * needed for manual reconciliation before rethrowing.
+ */
+async function persistConfirmedTrade<T>(
+  label: string,
+  recovery: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const delays = [500, 1_000, 2_000]
+  let lastErr: unknown
+  for (let i = 0; i <= delays.length; i++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      log.error({ err, label, attempt: i + 1 }, 'DB persist failed after confirmed tx')
+      if (i < delays.length) await new Promise((r) => setTimeout(r, delays[i]))
+    }
+  }
+  void sendTelegramAlert(
+    `🆘 <b>FALHA DE REGISTRO PÓS-TX CONFIRMADA</b> — ${label}\n\n` +
+      `A transação JÁ EXECUTOU on-chain mas o banco não gravou após 4 tentativas.\n` +
+      `${recovery}\n` +
+      `Erro: <code>${((lastErr as Error)?.message ?? 'unknown').slice(0, 200)}</code>`,
+  )
+  throw lastErr
+}
+
 // ── Contract ABIs ────────────────────────────────────────────────────────────
 
 const ERC20_ABI = [
@@ -206,6 +254,18 @@ export class RealExecutor implements BaseExecutor {
       return this.fail(startedAt, 'real executor MVP supports buy only via this path')
     }
 
+    // Input validation — parity with the paper executor. A misconfigured
+    // TRADE_SIZE_NATIVE must never reach the chain with real ETH.
+    if (signal.amountNative <= 0) {
+      return this.fail(startedAt, `invalid amountNative: ${signal.amountNative}`)
+    }
+    if (signal.amountNative > 10) {
+      return this.fail(
+        startedAt,
+        `amountNative ${signal.amountNative} exceeds sanity limit of 10 ETH`,
+      )
+    }
+
     // ── Redis atomic lock ──────────────────────────────────────────────────
     const acquired = await eventBus.client.set(
       lockKey, signal.signalId, 'EX', 60, 'NX',
@@ -305,59 +365,86 @@ export class RealExecutor implements BaseExecutor {
       if (signal.maxFeePerGas != null) txOverrides.maxFeePerGas = BigInt(signal.maxFeePerGas)
       if (signal.maxPriorityFeePerGas != null) txOverrides.maxPriorityFeePerGas = BigInt(signal.maxPriorityFeePerGas)
 
-      let swapTx: TransactionResponse
+      // 3b + 4. Send + confirm. An ambiguous failure (network error after a
+      // possible broadcast, confirmation re-checks exhausted) is NOT a clean
+      // failure: if the wallet's token balance grew, the buy DID land and MUST
+      // be recorded — orphan tokens have no TP/SL and no dev-dump monitor.
+      let receipt: TransactionReceipt | null = null
+      let recoveredTokensRaw = 0n
       try {
-        swapTx = await router.swapExactETHForTokens!(
-          minTokensOutRaw,
-          path,
-          wallet.address,
-          deadline,
-          txOverrides,
+        const swapTx: TransactionResponse = await withTxLock(() =>
+          router.swapExactETHForTokens!(
+            minTokensOutRaw,
+            path,
+            wallet.address,
+            deadline,
+            txOverrides,
+          ),
         )
-      } catch (err) {
-        return this.fail(startedAt, `Uniswap swapExactETHForTokens failed: ${(err as Error).message}`)
-      }
-
-      txHash = swapTx.hash
-
-      // 4. Confirm
-      let receipt: TransactionReceipt
-      try {
+        txHash = swapTx.hash
         receipt = await waitForConfirmation(swapTx, `buy:${signal.tokenAddress.slice(0, 10)}`)
       } catch (err) {
-        return this.fail(startedAt, `Confirmation failed: ${(err as Error).message}`)
-      }
-
-      // 5. Actual fill from the confirmed receipt. NEVER record more tokens
-      // than the wallet received: a later 100% sell of an overstated amount
-      // reverts transferFrom on every attempt and strands the position.
-      const fill = extractTxFill(receipt, wallet.address, signal.tokenAddress, WETH_ADDRESS)
-      const buyGasNative = Number(receipt.gasUsed * receipt.gasPrice) / 1e18
-
-      let actualTokensRaw: bigint
-      if (fill?.tokenDeltaRaw != null && fill.tokenDeltaRaw > 0n) {
-        actualTokensRaw = fill.tokenDeltaRaw
-      } else {
-        // Fallback 1: wallet balance delta (token emitted no standard Transfer)
-        let balanceDelta = 0n
-        try {
-          const postTokenBalanceRaw: bigint = await tokenReader.balanceOf!(wallet.address)
-          balanceDelta = postTokenBalanceRaw - preTokenBalanceRaw
-        } catch {
-          // fall through to the taxed quote
-        }
-        if (balanceDelta > 0n) {
-          actualTokensRaw = balanceDelta
-        } else {
-          // Fallback 2: quote minus the measured buy tax — conservative estimate
-          const quoteTokensRaw = BigInt(Math.floor(quote.tokensOut * 10 ** tokenDecimals))
-          const buyTaxBps = BigInt(Math.round((signal.honeypotProbe?.buyTaxPct ?? 0) * 100))
-          actualTokensRaw = quoteTokensRaw - (quoteTokensRaw * buyTaxBps) / 10_000n
-          log.warn(
-            { txHash, tokenAddress: signal.tokenAddress },
-            'Buy fill not found in logs or balance delta — recording taxed quote estimate',
+        if (isRetryableTxError(err)) {
+          recoveredTokensRaw = await this.awaitTokenArrival(
+            tokenReader,
+            wallet.address,
+            preTokenBalanceRaw,
           )
         }
+        if (recoveredTokensRaw <= 0n) {
+          return this.fail(startedAt, `buy tx failed: ${(err as Error).message}`)
+        }
+        txHash ??= `recovered:${Date.now()}`
+        log.error(
+          { txHash, tokenAddress: signal.tokenAddress, tokensRaw: recoveredTokensRaw.toString() },
+          'Buy landed without an observed receipt — recording position from balance delta',
+        )
+        void sendTelegramAlert(
+          `🟠 <b>COMPRA RECUPERADA SEM RECEIPT</b> — ${signal.tokenAddress.slice(0, 10)}\n\n` +
+            `A tx aterrissou mas a confirmação falhou; posição registrada pelo delta de ` +
+            `saldo (gas de entrada não capturado). Verifique no explorer: <code>${txHash}</code>`,
+        )
+      }
+
+      // 5. Actual fill — from the confirmed receipt when available. NEVER
+      // record more tokens than the wallet received: a later 100% sell of an
+      // overstated amount reverts transferFrom and strands the position.
+      let actualTokensRaw: bigint
+      let buyGasNative = 0
+      let fillSource: 'tx-logs' | 'balance-delta' | 'taxed-quote' | 'recovered-balance-delta'
+      if (receipt) {
+        const fill = extractTxFill(receipt, wallet.address, signal.tokenAddress, WETH_ADDRESS)
+        buyGasNative = Number(receipt.gasUsed * receipt.gasPrice) / 1e18
+        if (fill?.tokenDeltaRaw != null && fill.tokenDeltaRaw > 0n) {
+          actualTokensRaw = fill.tokenDeltaRaw
+          fillSource = 'tx-logs'
+        } else {
+          // Fallback 1: wallet balance delta (token emitted no standard Transfer)
+          let balanceDelta = 0n
+          try {
+            const postTokenBalanceRaw: bigint = await tokenReader.balanceOf!(wallet.address)
+            balanceDelta = postTokenBalanceRaw - preTokenBalanceRaw
+          } catch {
+            // fall through to the taxed quote
+          }
+          if (balanceDelta > 0n) {
+            actualTokensRaw = balanceDelta
+            fillSource = 'balance-delta'
+          } else {
+            // Fallback 2: quote minus the measured buy tax — conservative estimate
+            const quoteTokensRaw = BigInt(Math.floor(quote.tokensOut * 10 ** tokenDecimals))
+            const buyTaxBps = BigInt(Math.round((signal.honeypotProbe?.buyTaxPct ?? 0) * 100))
+            actualTokensRaw = quoteTokensRaw - (quoteTokensRaw * buyTaxBps) / 10_000n
+            fillSource = 'taxed-quote'
+            log.warn(
+              { txHash, tokenAddress: signal.tokenAddress },
+              'Buy fill not found in logs or balance delta — recording taxed quote estimate',
+            )
+          }
+        }
+      } else {
+        actualTokensRaw = recoveredTokensRaw
+        fillSource = 'recovered-balance-delta'
       }
 
       // Compute effective execution price
@@ -368,8 +455,13 @@ export class RealExecutor implements BaseExecutor {
           : quote.executionPrice
       const priceImpactPct = quote.priceImpactPct
 
-      // 6. Persist position
-      const position = await insertPosition({
+      // 6. Persist position — the buy is CONFIRMED; losing this write leaves
+      // real tokens with no TP/SL, so it retries and pages on failure.
+      const position = await persistConfirmedTrade(
+        `buy ${source.tokenMetadata?.symbol ?? signal.tokenAddress.slice(0, 10)}`,
+        `Tokens na carteira SEM posição registrada (sem TP/SL!). Tx: ${txHash}. ` +
+          `Registre a posição manualmente ou venda os tokens.`,
+        () => insertPosition({
         tokenAddress: signal.tokenAddress,
         ...(source.tokenMetadata?.name && {
           tokenName: source.tokenMetadata.name,
@@ -395,6 +487,7 @@ export class RealExecutor implements BaseExecutor {
         riskFlags: signal.opportunity.risk.flags,
         metadata: {
           route: 'uniswap',
+          fillSource,
           priceImpactPct,
           // Buy-side gas — read back at exit time so realized PnL reflects the
           // real wallet cost, matching the paper executor's accounting.
@@ -415,7 +508,7 @@ export class RealExecutor implements BaseExecutor {
           // reflect any on-chain tax, so no adjustment is applied here).
           ...(signal.honeypotProbe && { honeypotProbe: signal.honeypotProbe }),
         },
-      })
+      }))
 
       // Pre-approve the router in the background so the FIRST sell is a single
       // transaction. Without this, every exit pays approve+confirm latency at
@@ -433,7 +526,7 @@ export class RealExecutor implements BaseExecutor {
           executionPrice: executionPrice.toExponential(4),
           priceImpactPct: priceImpactPct.toFixed(3),
           gasNative: buyGasNative.toFixed(9),
-          fillSource: fill?.tokenDeltaRaw != null && fill.tokenDeltaRaw > 0n ? 'tx-logs' : 'fallback',
+          fillSource,
           route: 'uniswap',
           txHash,
           durationMs,
@@ -570,20 +663,34 @@ export class RealExecutor implements BaseExecutor {
       ? '0'
       : (totalTokensRaw - tokensToSellRaw).toString()
 
+    // The sell is CONFIRMED on-chain; losing this write leaves a ghost-open
+    // position (retried forever against a zero balance), so retry + page.
+    const persistRecovery =
+      `Venda JÁ executada (tx ${outcome.txSig}) mas a posição ${req.position.id} ` +
+      `segue aberta no banco. Feche manualmente com exit=${newExitNative.toFixed(9)} ` +
+      `pnl=${newPnlNative.toFixed(9)}.`
     if (req.sellPctOfPosition >= 100) {
       const finalStatus = req.reason === 'stop-loss' ? 'stopped' : 'closed'
-      await closePosition(req.position.id, {
-        exitAmountNative: newExitNative.toFixed(9),
-        realizedPnlNative: newPnlNative.toFixed(9),
-        exitTxHash: outcome.txSig,
-        status: finalStatus,
-      })
+      await persistConfirmedTrade(
+        `sell ${req.position.tokenSymbol ?? req.position.tokenAddress.slice(0, 10)}`,
+        persistRecovery,
+        () => closePosition(req.position.id, {
+          exitAmountNative: newExitNative.toFixed(9),
+          realizedPnlNative: newPnlNative.toFixed(9),
+          exitTxHash: outcome.txSig,
+          status: finalStatus,
+        }),
+      )
     } else {
-      await markPartialExit(req.position.id, {
-        exitAmountNative: newExitNative.toFixed(9),
-        realizedPnlNative: newPnlNative.toFixed(9),
-        moonbagTokens: remainingRaw,
-      })
+      await persistConfirmedTrade(
+        `partial sell ${req.position.tokenSymbol ?? req.position.tokenAddress.slice(0, 10)}`,
+        persistRecovery,
+        () => markPartialExit(req.position.id, {
+          exitAmountNative: newExitNative.toFixed(9),
+          realizedPnlNative: newPnlNative.toFixed(9),
+          moonbagTokens: remainingRaw,
+        }),
+      )
     }
 
     const durationMs = Date.now() - startedAt
@@ -662,10 +769,12 @@ export class RealExecutor implements BaseExecutor {
     if (allowance < tokensToSellRaw) {
       log.info({ token: tokenLabel, allowance: allowance.toString(), needed: tokensToSellRaw.toString() },
         'Approving Uniswap router for sell')
-      const approveTx: TransactionResponse = await token.approve!(
-        env.UNISWAP_ROUTER_ADDRESS,
-        tokensToSellRaw,
-        { gasLimit: APPROVE_GAS_LIMIT },
+      const approveTx: TransactionResponse = await withTxLock(() =>
+        token.approve!(
+          env.UNISWAP_ROUTER_ADDRESS,
+          tokensToSellRaw,
+          { gasLimit: APPROVE_GAS_LIMIT },
+        ),
       )
       const approveReceipt = await waitForConfirmation(approveTx, `approve:${tokenLabel}`)
       approveGasFeeWei = approveReceipt.gasUsed * approveReceipt.gasPrice
@@ -698,13 +807,15 @@ export class RealExecutor implements BaseExecutor {
           gasLimit: 300_000n, // generous limit for swapExactTokensForETHSupportingFeeOnTransferTokens
         }
 
-        const swapTx: TransactionResponse = await router.swapExactTokensForETHSupportingFeeOnTransferTokens!(
-          tokensToSellRaw,
-          minEthOutWei,
-          path,
-          wallet.address,
-          deadline,
-          txOverrides,
+        const swapTx: TransactionResponse = await withTxLock(() =>
+          router.swapExactTokensForETHSupportingFeeOnTransferTokens!(
+            tokensToSellRaw,
+            minEthOutWei,
+            path,
+            wallet.address,
+            deadline,
+            txOverrides,
+          ),
         )
 
         const receipt = await waitForConfirmation(swapTx, `sell:uniswap:${tokenLabel}:a${attempt}`)
@@ -761,10 +872,12 @@ export class RealExecutor implements BaseExecutor {
       const allowance: bigint = await token.allowance!(wallet.address, env.UNISWAP_ROUTER_ADDRESS)
       if (allowance >= MaxUint256 / 2n) return
 
-      const approveTx: TransactionResponse = await token.approve!(
-        env.UNISWAP_ROUTER_ADDRESS,
-        MaxUint256,
-        { gasLimit: APPROVE_GAS_LIMIT },
+      const approveTx: TransactionResponse = await withTxLock(() =>
+        token.approve!(
+          env.UNISWAP_ROUTER_ADDRESS,
+          MaxUint256,
+          { gasLimit: APPROVE_GAS_LIMIT },
+        ),
       )
       const receipt = await waitForConfirmation(approveTx, `pre-approve:${tokenLabel}`)
       log.info(
@@ -777,6 +890,28 @@ export class RealExecutor implements BaseExecutor {
         'Pre-approve failed — sell path will approve on demand',
       )
     }
+  }
+
+  /**
+   * Grace-poll the wallet's token balance after an ambiguous buy failure
+   * (send error that may have broadcast, or confirmation re-checks exhausted).
+   * Returns the positive balance delta if the tokens arrived, 0n otherwise.
+   */
+  private async awaitTokenArrival(
+    tokenReader: Contract,
+    owner: string,
+    preBalanceRaw: bigint,
+  ): Promise<bigint> {
+    for (let i = 0; i < TOKEN_ARRIVAL_CHECKS; i++) {
+      await new Promise((r) => setTimeout(r, TOKEN_ARRIVAL_INTERVAL_MS))
+      try {
+        const post: bigint = await tokenReader.balanceOf!(owner)
+        if (post > preBalanceRaw) return post - preBalanceRaw
+      } catch {
+        // RPC hiccup — keep polling until the window closes
+      }
+    }
+    return 0n
   }
 
   /** Extract PairState from PoolCreatedEvent — mirrors paper executor logic. */
