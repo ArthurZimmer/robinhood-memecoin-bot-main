@@ -10,6 +10,8 @@ const chatIds = (env.TELEGRAM_CHAT_ID ?? '')
   .map((s) => s.trim())
   .filter(Boolean)
 
+log.info({ chatCount: chatIds.length, chatIds }, 'Telegram alert targets configured')
+
 /**
  * Send a Telegram alert message via Bot API to every configured chat.
  * Best-effort only — never throws. If Telegram is unreachable, the alert is
