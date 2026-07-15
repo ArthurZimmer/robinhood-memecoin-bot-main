@@ -1,0 +1,19 @@
+# Never bake secrets into the image — .env is provided at runtime via env_file.
+.env
+.env.local
+.env.*.local
+
+# Rebuilt inside the image
+node_modules
+dist
+
+# Not needed at runtime
+.git
+.gitignore
+tests
+coverage
+.nyc_output
+*.log
+.DS_Store
+.vscode
+.idea

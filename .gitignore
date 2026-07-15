@@ -1,0 +1,24 @@
+# Secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+keypair.json
+
+# Node
+node_modules/
+dist/
+build/
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Misc
+coverage/
+.nyc_output/

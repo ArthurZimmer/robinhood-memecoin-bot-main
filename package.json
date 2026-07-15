@@ -1,0 +1,48 @@
+{
+  "name": "robinhood-memecoin-bot",
+  "version": "0.2.0",
+  "description": "Robinhood Chain memecoin trading bot — pump.fun sniper with auto-entry, partial take profit, moonbag, Telegram control",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsup src/main.ts --format esm --dts --out-dir dist",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio",
+    "db:push": "drizzle-kit push",
+    "dev:reset": "docker exec robinhood_bot_redis redis-cli DEL events:raw events:parsed events:candidates events:approved events:signals events:positions events:notifications && docker exec robinhood_bot_postgres psql -U bot -d robinhood_bot -c 'TRUNCATE positions, risk_evaluations CASCADE;'",
+    "cleanup:stale": "node scripts/cleanup-stale-positions.mjs",
+    "funnel": "node scripts/funnel.mjs",
+    "stop": "pkill -f 'src/main.ts' || true",
+    "restart": "npm run stop; sleep 2; nohup npm run dev > /tmp/bot-run.log 2>&1 & echo 'bot reiniciado em background — logs: /tmp/bot-run.log'",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "test:unit": "jest tests/unit",
+    "test:integration": "jest tests/integration"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "drizzle-orm": "^0.41.0",
+    "ethers": "^6.13.0",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.3",
+    "pino": "^9.4.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.6",
+    "@types/ws": "^8.5.12",
+    "drizzle-kit": "^0.30.0",
+    "pino-pretty": "^11.2.2",
+    "solc": "^0.8.36",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}
