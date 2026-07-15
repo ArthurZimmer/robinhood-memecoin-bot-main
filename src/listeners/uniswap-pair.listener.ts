@@ -393,7 +393,11 @@ export class UniswapPairListener {
     }
     const pairTotalSupply: string | undefined = fetchedPairSupply?.toString()
 
-    const deployerAddress = fetchedTx?.from ?? token0 // fallback
+    // Fallback: the token's own address. token0 could be WETH — shared across
+    // every launch, which poisoned deployer-burst tracking and the blacklist.
+    // The token address is unique per launch, so deployer-specific checks
+    // become neutral no-ops instead of firing on the wrong wallet.
+    const deployerAddress = fetchedTx?.from ?? memecoinAddress
 
     // ── Build and publish event ────────────────────────────────────────────────
     const event: PoolCreatedEvent = {

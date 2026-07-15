@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto'
-import { Contract, type TransactionReceipt, type TransactionResponse } from 'ethers'
+import { Contract, MaxUint256, type TransactionReceipt, type TransactionResponse, type Wallet } from 'ethers'
 import { createChildLogger } from '../utils/logger.js'
 import { env } from '../config/env.js'
 import { rhProvider, WETH_ADDRESS } from '../utils/robbinhood.utils.js'
 import { sendTelegramAlert } from '../utils/telegram.js'
 import { getBotWallet } from '../utils/wallet.js'
 import { eventBus } from '../events/event-bus.js'
-import { extractTxFill, realizedEthOutWei, realizedTokensRaw, type TxFill } from './tx-fill.js'
+import { extractTxFill, realizedEthOutWei } from './tx-fill.js'
 import {
   insertPosition,
   findOpenPositionByToken,
@@ -25,6 +25,7 @@ const log = createChildLogger('real-executor')
 const ERC20_ABI = [
   'function approve(address spender, uint256 amount) returns (bool)',
   'function allowance(address owner, address spender) view returns (uint256)',
+  'function balanceOf(address owner) view returns (uint256)',
   'function decimals() view returns (uint8)',
   'function name() view returns (string)',
   'function symbol() view returns (string)',
@@ -94,27 +95,6 @@ function isRetryableTxError(err: unknown): boolean {
     if (err instanceof TypeError) return true
   }
   return false
-}
-
-/**
- * Fetch the confirmed transaction receipt and extract the real on-chain fill
- * (ETH + token deltas). Returns `null` on any failure so callers fall back to
- * the quote estimate.
- */
-async function fetchTxFill(
-  txHash: string,
-  owner: string,
-  tokenAddress: string,
-): Promise<TxFill | null> {
-  try {
-    const receipt: TransactionReceipt | null = await rhProvider.getTransactionReceipt(txHash)
-    const fill = extractTxFill(receipt, owner, tokenAddress)
-    if (!fill) log.warn({ txHash }, 'Tx fill unavailable — using estimated amounts for PnL')
-    return fill
-  } catch (err) {
-    log.warn({ err, txHash }, 'Failed to fetch tx fill — using estimated amounts for PnL')
-    return null
-  }
 }
 
 /**
@@ -239,6 +219,16 @@ export class RealExecutor implements BaseExecutor {
       const deadline = Math.floor(Date.now() / 1000) + DEFAULT_DEADLINE_SECONDS
       const path = [WETH_ADDRESS, signal.tokenAddress]
 
+      // Wallet's token balance BEFORE the swap — fallback input for the fill
+      // extraction below (tokens with non-standard Transfer events).
+      const tokenReader = new Contract(signal.tokenAddress, ERC20_ABI, rhProvider)
+      let preTokenBalanceRaw = 0n
+      try {
+        preTokenBalanceRaw = await tokenReader.balanceOf!(wallet.address)
+      } catch {
+        // assume 0 — the dedicated wallet doesn't hold the token before buying it
+      }
+
       // Build tx overrides
       const txOverrides: Record<string, unknown> = {
         value: BigInt(Math.floor(signal.amountNative * 1e18)),
@@ -263,18 +253,44 @@ export class RealExecutor implements BaseExecutor {
       txHash = swapTx.hash
 
       // 4. Confirm
+      let receipt: TransactionReceipt
       try {
-        await waitForConfirmation(swapTx, `buy:${signal.tokenAddress.slice(0, 10)}`)
+        receipt = await waitForConfirmation(swapTx, `buy:${signal.tokenAddress.slice(0, 10)}`)
       } catch (err) {
         return this.fail(startedAt, `Confirmation failed: ${(err as Error).message}`)
       }
 
-      // 5. Read actual fill from confirmed tx
-      const fill = await fetchTxFill(txHash, wallet.address, signal.tokenAddress)
+      // 5. Actual fill from the confirmed receipt. NEVER record more tokens
+      // than the wallet received: a later 100% sell of an overstated amount
+      // reverts transferFrom on every attempt and strands the position.
+      const fill = extractTxFill(receipt, wallet.address, signal.tokenAddress, WETH_ADDRESS)
+      const buyGasNative = Number(receipt.gasUsed * receipt.gasPrice) / 1e18
 
-      // Determine actual tokens received
-      const fallbackTokensRaw = BigInt(Math.floor(quote.tokensOut * 10 ** tokenDecimals))
-      const actualTokensRaw = realizedTokensRaw(fill, fallbackTokensRaw)
+      let actualTokensRaw: bigint
+      if (fill?.tokenDeltaRaw != null && fill.tokenDeltaRaw > 0n) {
+        actualTokensRaw = fill.tokenDeltaRaw
+      } else {
+        // Fallback 1: wallet balance delta (token emitted no standard Transfer)
+        let balanceDelta = 0n
+        try {
+          const postTokenBalanceRaw: bigint = await tokenReader.balanceOf!(wallet.address)
+          balanceDelta = postTokenBalanceRaw - preTokenBalanceRaw
+        } catch {
+          // fall through to the taxed quote
+        }
+        if (balanceDelta > 0n) {
+          actualTokensRaw = balanceDelta
+        } else {
+          // Fallback 2: quote minus the measured buy tax — conservative estimate
+          const quoteTokensRaw = BigInt(Math.floor(quote.tokensOut * 10 ** tokenDecimals))
+          const buyTaxBps = BigInt(Math.round((signal.honeypotProbe?.buyTaxPct ?? 0) * 100))
+          actualTokensRaw = quoteTokensRaw - (quoteTokensRaw * buyTaxBps) / 10_000n
+          log.warn(
+            { txHash, tokenAddress: signal.tokenAddress },
+            'Buy fill not found in logs or balance delta — recording taxed quote estimate',
+          )
+        }
+      }
 
       // Compute effective execution price
       const actualTokensWhole = Number(actualTokensRaw) / 10 ** tokenDecimals
@@ -312,6 +328,9 @@ export class RealExecutor implements BaseExecutor {
         metadata: {
           route: 'uniswap',
           priceImpactPct,
+          // Buy-side gas — read back at exit time so realized PnL reflects the
+          // real wallet cost, matching the paper executor's accounting.
+          gasSpentNative: buyGasNative,
           pairReservesSnapshot: {
             ethReserve: pairState.ethReserve,
             tokenReserve: pairState.tokenReserve,
@@ -330,6 +349,11 @@ export class RealExecutor implements BaseExecutor {
         },
       })
 
+      // Pre-approve the router in the background so the FIRST sell is a single
+      // transaction. Without this, every exit pays approve+confirm latency at
+      // the worst possible moment (a dump firing the stop-loss).
+      void this.preApproveRouter(signal.tokenAddress, wallet)
+
       const durationMs = Date.now() - startedAt
       log.info(
         {
@@ -340,6 +364,8 @@ export class RealExecutor implements BaseExecutor {
           tokensReceived: actualTokensWhole,
           executionPrice: executionPrice.toExponential(4),
           priceImpactPct: priceImpactPct.toFixed(3),
+          gasNative: buyGasNative.toFixed(9),
+          fillSource: fill?.tokenDeltaRaw != null && fill.tokenDeltaRaw > 0n ? 'tx-logs' : 'fallback',
           route: 'uniswap',
           txHash,
           durationMs,
@@ -400,13 +426,58 @@ export class RealExecutor implements BaseExecutor {
       return this.failSell(startedAt, 'no tokens to sell')
     }
 
-    const tokensToSellRaw = (totalTokensRaw * BigInt(Math.round(req.sellPctOfPosition))) / 100n
+    const wallet = getBotWallet()
+    if (!wallet) {
+      return this.failSell(startedAt, 'no wallet configured')
+    }
+
+    let tokensToSellRaw = (totalTokensRaw * BigInt(Math.round(req.sellPctOfPosition))) / 100n
+
+    // Clamp to the wallet's REAL balance. Recorded fills can overstate what the
+    // wallet holds (fee-on-transfer, legacy quote-based records) — selling more
+    // than the balance reverts transferFrom on every retry, stranding the
+    // position while burning gas.
+    try {
+      const tokenReader = new Contract(req.position.tokenAddress, ERC20_ABI, rhProvider)
+      const walletBalanceRaw: bigint = await tokenReader.balanceOf!(wallet.address)
+      if (walletBalanceRaw === 0n) {
+        return this.failSell(
+          startedAt,
+          'wallet holds zero tokens for this position — manual reconciliation required',
+        )
+      }
+      if (req.sellPctOfPosition >= 100) {
+        // Full exit: sell the real balance so no dust is left behind
+        tokensToSellRaw = walletBalanceRaw
+      } else if (tokensToSellRaw > walletBalanceRaw) {
+        log.warn(
+          {
+            positionId: req.position.id,
+            recorded: tokensToSellRaw.toString(),
+            balance: walletBalanceRaw.toString(),
+          },
+          'Recorded tokens exceed wallet balance — clamping sell to balance',
+        )
+        tokensToSellRaw = walletBalanceRaw
+      }
+    } catch (err) {
+      log.warn(
+        { err, positionId: req.position.id },
+        'balanceOf check failed — proceeding with recorded amount',
+      )
+    }
     if (tokensToSellRaw === 0n) {
       return this.failSell(startedAt, `sellPctOfPosition too small — 0 tokens to sell`)
     }
 
     // ── Sell via Uniswap V2 (direct pair or Router) ───────────────────────
-    let outcome: { txSig: string; nativeOut: number; nativeOutWei: bigint; priceImpactPct: number }
+    let outcome: {
+      txSig: string
+      nativeOut: number
+      nativeOutWei: bigint
+      priceImpactPct: number
+      gasNative: number
+    }
     try {
       outcome = await this.sellViaUniswap(req, tokensToSellRaw)
     } catch (err) {
@@ -414,11 +485,21 @@ export class RealExecutor implements BaseExecutor {
     }
 
     // ── Update DB ─────────────────────────────────────────────────────────
+    // Gas accounting mirrors the paper executor: entry gas (stamped in metadata
+    // at buy time) + this sell's gas come out of realized PnL. On the (legacy)
+    // partial-exit path earlier sells' gas is not accumulated; with the
+    // full-exit TP policy there is exactly one sell.
+    const meta = req.position.metadata as
+      | { gasSpentNative?: number; tokenDecimals?: number }
+      | null
+    const buyGasNative = meta?.gasSpentNative ?? 0
     const entryNative = parseFloat(req.position.entryAmountNative)
     const priorExit = parseFloat(req.position.exitAmountNative ?? '0')
     const newExitNative = priorExit + outcome.nativeOut
-    const newPnlNative = newExitNative - entryNative
-    const remainingRaw = (totalTokensRaw - tokensToSellRaw).toString()
+    const newPnlNative = newExitNative - entryNative - buyGasNative - outcome.gasNative
+    const remainingRaw = req.sellPctOfPosition >= 100
+      ? '0'
+      : (totalTokensRaw - tokensToSellRaw).toString()
 
     if (req.sellPctOfPosition >= 100) {
       const finalStatus = req.reason === 'stop-loss' ? 'stopped' : 'closed'
@@ -443,6 +524,7 @@ export class RealExecutor implements BaseExecutor {
         reason: req.reason,
         sellPct: req.sellPctOfPosition,
         nativeReceived: outcome.nativeOut.toFixed(6),
+        gasNative: (buyGasNative + outcome.gasNative).toFixed(9),
         pnlNative: newPnlNative.toFixed(6),
         txHash: outcome.txSig,
         durationMs,
@@ -477,7 +559,8 @@ export class RealExecutor implements BaseExecutor {
       success: true,
       positionId: req.position.id,
       outputAmount: outcome.nativeOut.toFixed(9),
-      executionPrice: outcome.nativeOut / (Number(tokensToSellRaw) / 1e18),
+      executionPrice:
+        outcome.nativeOut / (Number(tokensToSellRaw) / 10 ** (meta?.tokenDecimals ?? 18)),
       realizedSlippagePct: outcome.priceImpactPct,
       txSignature: outcome.txSig,
       durationMs,
@@ -489,7 +572,13 @@ export class RealExecutor implements BaseExecutor {
   private async sellViaUniswap(
     req: RealSellRequest,
     tokensToSellRaw: bigint,
-  ): Promise<{ txSig: string; nativeOut: number; nativeOutWei: bigint; priceImpactPct: number }> {
+  ): Promise<{
+    txSig: string
+    nativeOut: number
+    nativeOutWei: bigint
+    priceImpactPct: number
+    gasNative: number
+  }> {
     const wallet = getBotWallet()
     if (!wallet) throw new Error('no wallet configured')
 
@@ -497,7 +586,9 @@ export class RealExecutor implements BaseExecutor {
     const router = new Contract(env.UNISWAP_ROUTER_ADDRESS, UNISWAP_V2_ROUTER_ABI, wallet)
     const token = new Contract(req.position.tokenAddress, ERC20_ABI, wallet)
 
-    // 1. Approve Uniswap router to spend tokens
+    // 1. Approve Uniswap router to spend tokens (normally a no-op — the buy
+    // path pre-approves MaxUint256 right after entry)
+    let approveGasFeeWei = 0n
     const allowance: bigint = await token.allowance!(wallet.address, env.UNISWAP_ROUTER_ADDRESS)
     if (allowance < tokensToSellRaw) {
       log.info({ token: tokenLabel, allowance: allowance.toString(), needed: tokensToSellRaw.toString() },
@@ -507,18 +598,23 @@ export class RealExecutor implements BaseExecutor {
         tokensToSellRaw,
         { gasLimit: APPROVE_GAS_LIMIT },
       )
-      await waitForConfirmation(approveTx, `approve:${tokenLabel}`)
+      const approveReceipt = await waitForConfirmation(approveTx, `approve:${tokenLabel}`)
+      approveGasFeeWei = approveReceipt.gasUsed * approveReceipt.gasPrice
     }
 
     // 2. Quote expected ETH out
     const path = [req.position.tokenAddress, WETH_ADDRESS]
-    const deadline = Math.floor(Date.now() / 1000) + DEFAULT_DEADLINE_SECONDS
 
     let lastError: Error | undefined
 
     for (let attempt = 0; attempt < MAX_SELL_RETRIES; attempt++) {
       try {
         const priorityFeeGwei = SELL_PRIORITY_FEES_GWEI[attempt] ?? SELL_PRIORITY_FEES_GWEI.at(-1)!
+
+        // Fresh deadline per attempt — backoff + confirmation timeouts can
+        // outlive a deadline computed once before the loop, auto-reverting
+        // every retry.
+        const deadline = Math.floor(Date.now() / 1000) + DEFAULT_DEADLINE_SECONDS
 
         // Get quote from router
         const amountsOut: bigint[] = await router.getAmountsOut!(tokensToSellRaw, path)
@@ -541,11 +637,13 @@ export class RealExecutor implements BaseExecutor {
           txOverrides,
         )
 
-        await waitForConfirmation(swapTx, `sell:uniswap:${tokenLabel}:a${attempt}`)
+        const receipt = await waitForConfirmation(swapTx, `sell:uniswap:${tokenLabel}:a${attempt}`)
 
-        // Read actual ETH received from confirmed tx
-        const fill = await fetchTxFill(swapTx.hash, wallet.address, req.position.tokenAddress)
+        // Actual ETH received = the WETH the router unwrapped in this tx.
+        // Falls back to the pre-trade quote only if the log is missing.
+        const fill = extractTxFill(receipt, wallet.address, req.position.tokenAddress, WETH_ADDRESS)
         const nativeOutWei = realizedEthOutWei(fill, expectedEthOutWei)
+        const gasNative = Number(approveGasFeeWei + receipt.gasUsed * receipt.gasPrice) / 1e18
 
         const priceImpactPct =
           expectedEthOutWei > 0n
@@ -562,6 +660,7 @@ export class RealExecutor implements BaseExecutor {
           nativeOut: Number(nativeOutWei) / 1e18,
           nativeOutWei,
           priceImpactPct: Math.max(0, priceImpactPct),
+          gasNative,
         }
       } catch (err) {
         lastError = err as Error
@@ -578,6 +677,36 @@ export class RealExecutor implements BaseExecutor {
     }
 
     throw lastError ?? new Error(`Uniswap sell failed after ${MAX_SELL_RETRIES} attempts`)
+  }
+
+  /**
+   * Background unlimited approve fired right after a buy confirms, so the
+   * first sell is a single transaction instead of approve+swap. Failures are
+   * non-fatal — the sell path still approves on demand.
+   */
+  private async preApproveRouter(tokenAddress: string, wallet: Wallet): Promise<void> {
+    const tokenLabel = tokenAddress.slice(0, 10)
+    try {
+      const token = new Contract(tokenAddress, ERC20_ABI, wallet)
+      const allowance: bigint = await token.allowance!(wallet.address, env.UNISWAP_ROUTER_ADDRESS)
+      if (allowance >= MaxUint256 / 2n) return
+
+      const approveTx: TransactionResponse = await token.approve!(
+        env.UNISWAP_ROUTER_ADDRESS,
+        MaxUint256,
+        { gasLimit: APPROVE_GAS_LIMIT },
+      )
+      const receipt = await waitForConfirmation(approveTx, `pre-approve:${tokenLabel}`)
+      log.info(
+        { token: tokenLabel, gasNative: (Number(receipt.gasUsed * receipt.gasPrice) / 1e18).toFixed(9) },
+        'Router pre-approved — exits are now single-tx',
+      )
+    } catch (err) {
+      log.warn(
+        { err, token: tokenLabel },
+        'Pre-approve failed — sell path will approve on demand',
+      )
+    }
   }
 
   /** Extract PairState from PoolCreatedEvent — mirrors paper executor logic. */

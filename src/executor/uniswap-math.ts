@@ -244,6 +244,33 @@ export function normalizeReservesFromCache(
   }
 }
 
+/**
+ * WETH-side reserve of a pair in whole ETH, from raw event fields.
+ * Returns 0 when the ordering or reserves are unknown — callers treat 0 as
+ * "liquidity not yet available". Never returns the token-side reserve.
+ */
+export function ethSideReserveNative(
+  fields: {
+    token0?: string | undefined
+    token1?: string | undefined
+    reserve0?: string | undefined
+    reserve1?: string | undefined
+  },
+  wethAddress: string,
+): number {
+  const { token0, token1, reserve0, reserve1 } = fields
+  if (!token0 || !token1 || !reserve0 || !reserve1) return 0
+
+  const wethLower = wethAddress.toLowerCase()
+  let raw: string
+  if (token0.toLowerCase() === wethLower) raw = reserve0
+  else if (token1.toLowerCase() === wethLower) raw = reserve1
+  else return 0
+
+  const eth = parseFloat(raw) / 1e18
+  return Number.isFinite(eth) && eth > 0 ? eth : 0
+}
+
 // ── Quote functions ───────────────────────────────────────────────────────────
 
 /**

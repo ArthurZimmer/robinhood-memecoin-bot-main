@@ -302,14 +302,22 @@ export class DashboardServer {
       const isEstimated = snap === undefined
       const spot = snap?.spotPriceNative ?? (isEstimated ? entry : undefined)
       const pnlPct = snap?.pnlPct ?? null // no false PnL when estimated
+
+      // Token decimals come from position metadata (stamped at entry). The old
+      // hardcoded 1e6 was a Solana leftover — with 18-decimals ERC-20s it
+      // inflated unrealized PnL by 10^12.
+      const meta = row.metadata as { totalSupply?: string; tokenDecimals?: number } | null
+      const tokenDecimals = meta?.tokenDecimals ?? 18
+
       const unrealizedPnlNative =
         spot !== undefined && !isEstimated && row.tokensReceived
-          ? (spot - entry) * (Number(BigInt(row.tokensReceived)) / 1e6)
+          ? (spot - entry) * (Number(BigInt(row.tokensReceived)) / 10 ** tokenDecimals)
           : null
 
       // Market cap = price × total supply. Total supply stored in position metadata.
-      const meta = row.metadata as { totalSupply?: string } | null
-      const totalSupplyNum = meta?.totalSupply ? Number(meta.totalSupply) / 1e18 : null
+      const totalSupplyNum = meta?.totalSupply
+        ? Number(meta.totalSupply) / 10 ** tokenDecimals
+        : null
       const entryMarketCapNative = totalSupplyNum !== null ? entry * totalSupplyNum : null
       const currentMarketCapNative =
         spot !== undefined && totalSupplyNum !== null ? spot * totalSupplyNum : null

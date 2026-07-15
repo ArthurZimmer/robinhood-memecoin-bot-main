@@ -345,29 +345,15 @@ export class PositionManager {
       const pair = await this.fetchPairState(position)
 
       if (!pair) {
-        // Dead pair — pair account gone or reserves unavailable
-        const ageMs = Date.now() - position.openedAt.getTime()
-        if (ageMs > this.staleKillAgeMs) {
-          const meta = position.metadata as
-            | { pairReservesSnapshot?: { ethReserve?: number; tokenReserve?: number } }
-            | null
-          const entryTokenDecimals = 18 // fallback — we don't have tokenDecimals in metadata
-          const entryState: PairState = {
-            ethReserve: meta?.pairReservesSnapshot?.ethReserve ?? 0,
-            tokenReserve: meta?.pairReservesSnapshot?.tokenReserve ?? 0,
-            tokenDecimals: entryTokenDecimals,
-          }
-          log.warn(
-            { positionId: position.id, tokenAddress: position.tokenAddress, ageMs },
-            'Pair reserves unavailable — force-closing dead position',
-          )
-          await this.doSell(position, 100, 'stale-flat', entryState)
-        } else {
-          log.debug(
-            { positionId: position.id, poolAddress: position.poolAddress },
-            'Pair reserves not available — retry next sync',
-          )
-        }
+        // Reserves unreadable. A REAL dead pair (LP pulled) makes the probe
+        // above revert and is closed as a total loss by closeUnsellable — so
+        // reaching here means a transient RPC failure. Do NOT fabricate an
+        // exit off the entry snapshot (that recorded rugs/outages as
+        // break-even); just retry on the next sweep.
+        log.debug(
+          { positionId: position.id, poolAddress: position.poolAddress },
+          'Pair reserves not available — retry next sync',
+        )
         return
       }
 

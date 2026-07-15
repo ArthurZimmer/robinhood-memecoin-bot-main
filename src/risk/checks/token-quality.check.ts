@@ -1,5 +1,6 @@
 import type { CandidateOpportunity, PoolCreatedEvent } from '../../events/event-types.js'
 import { analyzeSymbol, analyzeName, scoreInitialLiquidity } from '../../analysis/token-analyzer.js'
+import { ethSideReserveNative } from '../../executor/uniswap-math.js'
 import { WETH_ADDRESS } from '../../utils/robbinhood.utils.js'
 import { fail, pass, type RiskCheck, type CheckResult } from './base.check.js'
 
@@ -22,7 +23,7 @@ export class TokenQualityCheck implements RiskCheck {
     const md = source.tokenMetadata
 
     // Compute initial ETH liquidity from pair reserves (replaces Pump.fun dev-buy)
-    const initialLiquidityNative = this.computeInitialLiquidity(source)
+    const initialLiquidityNative = ethSideReserveNative(source, WETH_ADDRESS)
 
     // ── Symbol analysis ─────────────────────────────────────────────────────
     const sym = analyzeSymbol(md?.symbol)
@@ -104,24 +105,6 @@ export class TokenQualityCheck implements RiskCheck {
     )
   }
 
-  /** Determine initial ETH liquidity from the pair creation event reserves. */
-  private computeInitialLiquidity(event: PoolCreatedEvent): number {
-    const r0 = event.reserve0
-    const r1 = event.reserve1
-    if (!r0 || !r1) return 0
-
-    const wethLower = WETH_ADDRESS.toLowerCase()
-    const t0 = event.token0?.toLowerCase()
-    const t1 = event.token1?.toLowerCase()
-
-    try {
-      if (t0 === wethLower) return parseFloat(r0) / 1e18
-      if (t1 === wethLower) return parseFloat(r1) / 1e18
-    } catch {
-      // parseFloat failure on malformed reserve string
-    }
-    return 0
-  }
 }
 
 export const tokenQualityCheck = new TokenQualityCheck()

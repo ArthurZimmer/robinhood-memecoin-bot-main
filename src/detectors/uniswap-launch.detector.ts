@@ -14,6 +14,8 @@ import {
   stringSimilarity,
   normalizeSymbol,
 } from '../analysis/token-analyzer.js'
+import { ethSideReserveNative } from '../executor/uniswap-math.js'
+import { WETH_ADDRESS } from '../utils/robbinhood.utils.js'
 
 const log = createChildLogger('uniswap-launch-detector')
 
@@ -237,10 +239,10 @@ export class UniswapLaunchDetector {
       return null
     }
 
-    // Compute initial liquidity from reserves (one side is ETH)
-    const reserve0 = event.reserve0 ? parseFloat(event.reserve0) / 1e18 : 0
-    const reserve1 = event.reserve1 ? parseFloat(event.reserve1) / 1e18 : 0
-    const initialLiquidityNative = Math.max(reserve0, reserve1)
+    // Initial ETH liquidity = the WETH-side reserve. Taking max(reserve0,
+    // reserve1) picked the TOKEN reserve (billions of units) for every normal
+    // pair, which silently disabled the risk engine's liquidity check.
+    const initialLiquidityNative = ethSideReserveNative(event, WETH_ADDRESS)
 
     const candidate: CandidateOpportunity = {
       candidateId: randomUUID(),
