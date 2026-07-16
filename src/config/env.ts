@@ -26,6 +26,12 @@ const envSchema = z.object({
   STOP_LOSS_PCT: z.coerce.number().positive().default(50),
   MAX_OPEN_POSITIONS: z.coerce.number().int().positive().default(5),
   DAILY_LOSS_LIMIT_NATIVE: z.coerce.number().positive().default(0.5),
+  /**
+   * Anti-copycat: skip a candidate whose symbol matches a position closed IN
+   * PROFIT within this window (minutes). Rug factories relaunch just-pumped
+   * tickers and pull the LP minutes later. 0 disables the gate.
+   */
+  COPYCAT_SYMBOL_COOLDOWN_MIN: z.coerce.number().nonnegative().default(60),
 
   // ── Multi-tier entry filter ──────────────────────────────────────────────────
   /** Absolute floor market cap (USD). Tokens below this are ALWAYS rejected. */

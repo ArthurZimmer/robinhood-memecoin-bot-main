@@ -16,12 +16,15 @@ export class LiquidityCheck implements RiskCheck {
   async evaluate(candidate: CandidateOpportunity): Promise<CheckResult> {
     const lp = candidate.initialLiquidityNative
 
-    // Severity 'high' instead of 'critical': on Uniswap V2, the PairCreated event
-    // can fire before initial liquidity is added to the pair (race condition).
-    // A 'critical' here would permanently reject tokens with transient zero reserves.
-    // The strategy re-fetches reserves before trading, so a 0 here is not terminal.
+    // HARD REJECT. This was 'high' to tolerate a PairCreated→addLiquidity race,
+    // but an LP-pull rug factory exploits exactly that leniency: create the pair
+    // EMPTY (passes evaluation on aggregate score), inject liquidity afterwards,
+    // pump, and pull ~90-120s after entry — observed 2026-07-15 as two total
+    // losses with this fingerprint (flags token-quality+liquidity, score 22).
+    // Legit launches on this chain add liquidity atomically with pair creation,
+    // so a zero here is the scam signature, not a race.
     if (!Number.isFinite(lp) || lp <= 0) {
-      return fail('high', 80, `liquidity not yet available: ${lp}`)
+      return fail('critical', 80, `zero liquidity at evaluation — LP-pull factory fingerprint: ${lp}`)
     }
 
     if (lp < MIN_LIQUIDITY_NATIVE) {

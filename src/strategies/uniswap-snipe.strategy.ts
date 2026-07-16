@@ -19,6 +19,7 @@ import {
 } from '../analysis/token-analyzer.js'
 import {
   countOpenPositions,
+  countRecentProfitableClosesBySymbol,
   todayRealizedPnlNative,
 } from '../positions/position.repository.js'
 import {
@@ -213,6 +214,30 @@ export class UniswapSnipeStrategy implements BaseStrategy {
     // ── Token age gate ───────────────────────────────────────────────────────
     const source = opp.sourceEvent as PoolCreatedEvent
     const tokenAgeMs = Date.now() - (source.timestamp ?? opp.timestamp)
+
+    // ── Anti-copycat gate ────────────────────────────────────────────────────
+    // Rug factories relaunch the ticker of a token that just pumped (often one
+    // we took profit on minutes earlier) and pull the LP ~20min in. A recent
+    // profitable close on the same symbol marks this launch as bait.
+    const candidateSymbol = source.tokenMetadata?.symbol
+    if (candidateSymbol && env.COPYCAT_SYMBOL_COOLDOWN_MIN > 0) {
+      const recentWins = await countRecentProfitableClosesBySymbol(
+        this.executor.mode,
+        candidateSymbol,
+        env.COPYCAT_SYMBOL_COOLDOWN_MIN * 60_000,
+      )
+      if (recentWins > 0) {
+        log.warn(
+          {
+            tokenAddress: opp.tokenAddress,
+            symbol: candidateSymbol,
+            cooldownMin: env.COPYCAT_SYMBOL_COOLDOWN_MIN,
+          },
+          'Copycat symbol relaunch — skip',
+        )
+        return null
+      }
+    }
     if (tokenAgeMs < env.MIN_TOKEN_AGE_MS) {
       log.debug(
         { tokenAddress: opp.tokenAddress, tokenAgeMs, min: env.MIN_TOKEN_AGE_MS },
