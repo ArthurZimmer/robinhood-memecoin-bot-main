@@ -31,7 +31,13 @@ const envSchema = z.object({
    * PROFIT within this window (minutes). Rug factories relaunch just-pumped
    * tickers and pull the LP minutes later. 0 disables the gate.
    */
-  COPYCAT_SYMBOL_COOLDOWN_MIN: z.coerce.number().nonnegative().default(60),
+  COPYCAT_SYMBOL_COOLDOWN_MIN: z.coerce.number().nonnegative().default(1_440),
+  /**
+   * LP-pull guard: reject entry when the deployer holds more than this % of
+   * the pair's LP tokens. Legit launches on this chain burn 100% of LP at
+   * creation; holding LP is what makes a one-tx pool drain possible.
+   */
+  LP_MAX_DEPLOYER_PCT: z.coerce.number().nonnegative().default(20),
 
   // ── Multi-tier entry filter ──────────────────────────────────────────────────
   /** Absolute floor market cap (USD). Tokens below this are ALWAYS rejected. */

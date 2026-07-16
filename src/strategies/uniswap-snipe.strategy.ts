@@ -30,6 +30,7 @@ import {
 } from '../events/event-types.js'
 import { probeToken, passesHoneypotGate } from '../risk/honeypot-probe.js'
 import { scanTokenCapabilities } from '../risk/capability-scan.js'
+import { checkLpConcentration } from '../risk/lp-guard.js'
 import type { BaseStrategy } from './base.strategy.js'
 import type { BaseExecutor } from '../executor/base.executor.js'
 
@@ -346,6 +347,24 @@ export class UniswapSnipeStrategy implements BaseStrategy {
           error: capabilities.error,
         },
         'ENTRY REJECTED — sell-blocking capabilities with live owner',
+      )
+      return null
+    }
+
+    // ── LP-pull guard ────────────────────────────────────────────────────────
+    // Legit launches on this chain burn 100% of the LP at creation; the rug
+    // factory keeps ~100% and drains the pool ~19.5min in. Deployer holding
+    // LP is the root capability behind every LP-pull loss we recorded.
+    const lpGuard = await checkLpConcentration(opp.poolAddress, opp.deployerAddress)
+    if (!lpGuard.ok) {
+      log.warn(
+        {
+          tokenAddress: opp.tokenAddress,
+          symbol: source.tokenMetadata?.symbol ?? '?',
+          poolAddress: opp.poolAddress,
+          detail: lpGuard.detail,
+        },
+        'ENTRY REJECTED — LP concentration (LP-pull risk)',
       )
       return null
     }
