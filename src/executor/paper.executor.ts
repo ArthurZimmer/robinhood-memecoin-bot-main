@@ -66,6 +66,7 @@ function gasNative(units: bigint, priceWei: bigint): number {
 export type SellReason =
   | 'take-profit'
   | 'stop-loss'
+  | 'trailing-stop' // Drawdown from peak after arming — moonshot exit
   | 'manual'
   | 'shutdown'
   | 'stale-flat' // Position dormant — no volume, frees up cap slot
@@ -251,6 +252,9 @@ export class PaperExecutor implements BaseExecutor {
           feeNative: fillQuote.feeNative,
           priceImpactPct: fillQuote.priceImpactPct,
           gasSpentNative: buyGasNative,
+          // Trailing config in force at entry — audit only, the exit policy
+          // reads these from env at runtime so they stay tunable live.
+          trailing: { stopPct: env.TRAILING_STOP_PCT, armPct: env.TRAILING_ARM_PCT },
           pairReservesSnapshot: {
             ethReserve: (liveState ?? pair).ethReserve,
             tokenReserve: (liveState ?? pair).tokenReserve,
@@ -488,8 +492,9 @@ export class PaperExecutor implements BaseExecutor {
     const txSignature = `paper:${randomUUID()}`
 
     // ── Gas realism — subtract estimated buy+sell gas from realized PnL ─────
-    // Note: on the (legacy) partial-exit path earlier sells' gas is not
-    // accumulated; with the full-exit TP policy there is exactly one sell.
+    // Note: on the partial-exit path (de-risk + trailing = two sells) the
+    // earlier sell's gas is not accumulated — final PnL undercounts by one
+    // sell's gas (~0.0002 ETH), accepted as negligible.
     const sellGasNative = gasNative(SELL_GAS_UNITS, await currentGasPriceWei())
     const buyGasNative = meta?.gasSpentNative ?? 0
 
@@ -571,6 +576,7 @@ export class PaperExecutor implements BaseExecutor {
       const reasonEmoji: Record<string, string> = {
         'take-profit': '💰',
         'stop-loss': '🛑',
+        'trailing-stop': '📉',
         manual: '👋',
         'stale-flat': '💤',
         'dev-sell': '🚨',

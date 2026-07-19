@@ -222,6 +222,8 @@ async function bootstrap(): Promise<void> {
       takeProfitPct: env.TAKE_PROFIT_PCT,
       sellPctAtTp: env.SELL_PCT_AT_TP,
       stopLossPct: env.STOP_LOSS_PCT,
+      trailingStopPct: env.TRAILING_STOP_PCT,
+      trailingArmPct: env.TRAILING_ARM_PCT,
       maxOpenPositions: env.MAX_OPEN_POSITIONS,
     },
     'Bot initialized — pipeline running (UniswapPairListener → Parser → Detector → RiskEngine → Strategy → Executor + PositionManager)',

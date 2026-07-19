@@ -121,6 +121,7 @@ const SELL_PRIORITY_FEES_GWEI = [2n, 5n, 10n]
 export type SellReason =
   | 'take-profit'
   | 'stop-loss'
+  | 'trailing-stop' // drawdown from peak after arming — moonshot exit
   | 'manual'
   | 'shutdown'
   | 'stale-flat'
@@ -138,6 +139,8 @@ const SELL_SLIPPAGE_PCT_BY_REASON: Record<SellReason, number> = {
   shutdown: 10,
   'stale-flat': 10,
   'stop-loss': 25,
+  // Fires on a retrace/dump from the peak — same urgency as a stop-loss
+  'trailing-stop': 25,
   'dev-sell': 50,
 }
 
@@ -489,6 +492,9 @@ export class RealExecutor implements BaseExecutor {
           route: 'uniswap',
           fillSource,
           priceImpactPct,
+          // Trailing config in force at entry — audit only, the exit policy
+          // reads these from env at runtime so they stay tunable live.
+          trailing: { stopPct: env.TRAILING_STOP_PCT, armPct: env.TRAILING_ARM_PCT },
           // Buy-side gas — read back at exit time so realized PnL reflects the
           // real wallet cost, matching the paper executor's accounting.
           gasSpentNative: buyGasNative,
@@ -648,9 +654,9 @@ export class RealExecutor implements BaseExecutor {
 
     // ── Update DB ─────────────────────────────────────────────────────────
     // Gas accounting mirrors the paper executor: entry gas (stamped in metadata
-    // at buy time) + this sell's gas come out of realized PnL. On the (legacy)
-    // partial-exit path earlier sells' gas is not accumulated; with the
-    // full-exit TP policy there is exactly one sell.
+    // at buy time) + this sell's gas come out of realized PnL. On the
+    // partial-exit path (de-risk + trailing = two sells) the earlier sell's
+    // gas is not accumulated — final PnL undercounts by one sell's gas.
     const meta = req.position.metadata as
       | { gasSpentNative?: number; tokenDecimals?: number }
       | null
@@ -714,6 +720,7 @@ export class RealExecutor implements BaseExecutor {
       const reasonEmoji: Record<string, string> = {
         'take-profit': '💰',
         'stop-loss': '🛑',
+        'trailing-stop': '📉',
         manual: '👋',
         'stale-flat': '💤',
         'dev-sell': '🚨',

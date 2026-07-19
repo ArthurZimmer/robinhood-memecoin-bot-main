@@ -68,6 +68,14 @@ export const positions = pgTable('positions', {
   isMoonbag: boolean('is_moonbag').notNull().default(false),
   moonbagTokens: numeric('moonbag_tokens', { precision: 30, scale: 0 }),
 
+  // ── Peak-price instrumentation ──────────────────────────────────────────────
+  // Highest post-entry spot price observed while the position was tracked, plus
+  // when it happened. Lets us measure how far winners actually run (peak / entry
+  // = multiple) to calibrate a moonbag / trailing-stop. Null until price first
+  // exceeds entry.
+  peakPriceNative: numeric('peak_price_native', { precision: 20, scale: 12 }),
+  peakAt: timestamp('peak_at', { withTimezone: true }),
+
   // ── Risk snapshot at entry ──────────────────────────────────────────────────
   riskScore: integer('risk_score'),      // 0-100
   riskLevel: text('risk_level'),         // 'low' | 'medium' | 'high' | 'critical'

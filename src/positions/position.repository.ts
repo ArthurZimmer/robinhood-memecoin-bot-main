@@ -107,6 +107,26 @@ export async function listActivePositions(mode: 'paper' | 'real'): Promise<Posit
     .where(and(eq(positions.mode, mode), isNull(positions.closedAt)))
 }
 
+/**
+ * Records a new post-entry price high for a position (peak-price instrumentation).
+ * Idempotent + race-safe: the WHERE guard only writes when the incoming price
+ * beats the stored peak (or none exists), so out-of-order pushes never lower it.
+ */
+export async function recordPeakPrice(
+  positionId: string,
+  peakPriceNative: string,
+): Promise<void> {
+  await db
+    .update(positions)
+    .set({ peakPriceNative, peakAt: new Date() })
+    .where(
+      and(
+        eq(positions.id, positionId),
+        sql`(${positions.peakPriceNative} IS NULL OR ${positions.peakPriceNative}::numeric < ${peakPriceNative}::numeric)`,
+      ),
+    )
+}
+
 export async function markPartialExit(
   positionId: string,
   delta: {

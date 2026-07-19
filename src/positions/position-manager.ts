@@ -3,10 +3,11 @@ import { createChildLogger } from '../utils/logger.js'
 import { env } from '../config/env.js'
 import { rhProvider, WETH_ADDRESS } from '../utils/robbinhood.utils.js'
 import { wsManager } from '../utils/ws-manager.js'
-import { listActivePositions, closePosition } from './position.repository.js'
+import { listActivePositions, closePosition, recordPeakPrice, findPositionById } from './position.repository.js'
+import { decideExit, type ExitDecision } from './exit-policy.js'
 import { probeToken } from '../risk/honeypot-probe.js'
 import { sendTelegramAlert } from '../utils/telegram.js'
-import { paperExecutor } from '../executor/paper.executor.js'
+import { paperExecutor, type SellReason } from '../executor/paper.executor.js'
 import { realExecutor } from '../executor/real.executor.js'
 import {
   getRawPairReserves,
@@ -82,6 +83,8 @@ export interface LivePositionSnapshot {
   entryPriceNative: number
   spotPriceNative: number
   pnlPct: number
+  /** Highest post-entry spot price — drives the trailing stop. */
+  peakPriceNative: number
   // Raw reserves at snapshot time — lets the dashboard quote an executable
   // exit (impact + fee included) instead of marking at mid-price.
   ethReserve: number
@@ -105,6 +108,8 @@ export class PositionManager {
   private readonly positionCache = new Map<string, Position>()
   // Immutable pair info per position — lets Sync pushes be normalized with zero RPC
   private readonly pairInfoCache = new Map<string, { info: CachedPairInfo; isToken0Eth: boolean }>()
+  // Highest post-entry spot price seen per position — peak-price instrumentation
+  private readonly peakPrice = new Map<string, number>()
   // Dev wallet rug-pull monitor — watches deployer's token balance for dumps
   private readonly devWalletMonitor: DevWalletMonitor
 
@@ -204,6 +209,20 @@ export class PositionManager {
       this.positionCache.set(position.id, position)
 
       if (isNew) {
+        // Seed the in-memory peak from the DB so the trailing stop survives
+        // restarts — otherwise it disarms until a new high prints.
+        const entry = parseFloat(position.entryPriceNative)
+        const dbPeak = position.peakPriceNative ? parseFloat(position.peakPriceNative) : NaN
+        const seed = Math.max(
+          Number.isFinite(entry) ? entry : 0,
+          Number.isFinite(dbPeak) ? dbPeak : 0,
+        )
+        if (seed > 0) {
+          this.peakPrice.set(position.id, seed)
+          if (Number.isFinite(dbPeak) && dbPeak > entry) {
+            log.debug({ positionId: position.id, seed }, 'Peak restored from DB')
+          }
+        }
         this.subscribeSync(position)
         void this.devWalletMonitor.watch(position)
         log.debug(
@@ -404,6 +423,18 @@ export class PositionManager {
     const spotPrice = pair.ethReserve / pair.tokenReserve
     const pnlPct = ((spotPrice - entryPrice) / entryPrice) * 100
 
+    // ── Peak-price instrumentation ─────────────────────────────────────────────
+    // Record the highest post-entry price so we can measure how far winners run
+    // (peak / entry = multiple) and calibrate a moonbag / trailing-stop. Monotonic
+    // → the DB write fires only on a NEW high, so writes taper off. Non-fatal.
+    const prevPeak = this.peakPrice.get(position.id) ?? entryPrice
+    if (Number.isFinite(spotPrice) && spotPrice > prevPeak) {
+      this.peakPrice.set(position.id, spotPrice)
+      void recordPeakPrice(position.id, spotPrice.toFixed(12)).catch((err) => {
+        log.debug({ err, positionId: position.id }, 'recordPeakPrice failed — non-fatal')
+      })
+    }
+
     // Update snapshot for dashboard
     this.snapshots.set(position.id, {
       positionId: position.id,
@@ -411,6 +442,7 @@ export class PositionManager {
       entryPriceNative: entryPrice,
       spotPriceNative: spotPrice,
       pnlPct,
+      peakPriceNative: this.peakPrice.get(position.id) ?? entryPrice,
       ethReserve: pair.ethReserve,
       tokenReserve: pair.tokenReserve,
       fetchedAt: Date.now(),
@@ -526,6 +558,7 @@ export class PositionManager {
     this.positionCache.delete(positionId)
     this.snapshots.delete(positionId)
     this.pairInfoCache.delete(positionId)
+    this.peakPrice.delete(positionId)
     this.devWalletMonitor.unwatch(positionId)
     wsManager.unregister(this.syncKey(positionId))
     log.debug({ positionId }, 'Unsubscribed closed position')
@@ -534,7 +567,7 @@ export class PositionManager {
   private async doSell(
     position: Position,
     sellPct: number,
-    reason: 'take-profit' | 'stop-loss' | 'manual' | 'stale-flat' | 'dev-sell',
+    reason: SellReason,
     currentState: PairState,
   ): Promise<void> {
     if (this.inflight.has(position.id)) return
@@ -576,6 +609,24 @@ export class PositionManager {
           // the stale 'open' status and fire duplicate sells.
           position.status = 'closed'
           this.untrack(position.id)
+        } else {
+          // Partial sell (de-risk): the cached object still says 'open' with
+          // the full tokensReceived — a Sync push before the next syncTick
+          // would re-fire the de-risk over the ORIGINAL total (double sell).
+          // Refresh from DB before releasing inflight; the in-place fallback
+          // is enough to block the de-risk status gate until the next tick.
+          try {
+            const fresh = await findPositionById(position.id)
+            if (fresh) {
+              this.positionCache.set(position.id, fresh)
+            } else {
+              position.status = 'partial_exit'
+              position.isMoonbag = true
+            }
+          } catch {
+            position.status = 'partial_exit'
+            position.isMoonbag = true
+          }
         }
       } else {
         log.warn({ positionId: position.id, error: result.error }, 'Executor rejected sell')
@@ -587,32 +638,28 @@ export class PositionManager {
 
   // ── Decision ──────────────────────────────────────────────────────────────
 
-  private decide(
-    position: Position,
-    pair: PairState,
-  ): { sellPct: number; reason: 'take-profit' | 'stop-loss'; pnlPct: number } | null {
+  // Thin wrapper around the pure exit policy (see exit-policy.ts): hard SL,
+  // then trailing stop from the peak, then a one-shot partial de-risk at TP.
+  // TP/SL thresholds come from the per-position snapshot (as before);
+  // sellPctAtTp and the trailing config are read from env at RUNTIME so they
+  // can be tuned while positions are open.
+  private decide(position: Position, pair: PairState): ExitDecision | null {
     const entryPrice = parseFloat(position.entryPriceNative)
     if (!Number.isFinite(entryPrice) || entryPrice <= 0) return null
 
-    const spotPrice = pair.ethReserve / pair.tokenReserve
-    const pnlPct = ((spotPrice - entryPrice) / entryPrice) * 100
-
-    const tpPct = parseFloat(position.takeProfitPct)
-    const slPct = parseFloat(position.stopLossPct)
-
-    // Stop loss — full exit
-    if (pnlPct <= -slPct) {
-      return { sellPct: 100, reason: 'stop-loss', pnlPct }
-    }
-
-    // Take profit — ALWAYS a full 100% exit and position close (safety policy:
-    // no moonbag). Intentionally ignores the per-position sellPctAtTp so legacy
-    // DB rows created with partial-TP configs also close in full.
-    if (position.status === 'open' && pnlPct >= tpPct) {
-      return { sellPct: 100, reason: 'take-profit', pnlPct }
-    }
-
-    return null
+    return decideExit({
+      entryPrice,
+      spotPrice: pair.ethReserve / pair.tokenReserve,
+      // evaluatePair ratchets the peak BEFORE calling decide, so the current
+      // tick's high is already included (a fresh high ⇒ drawdown 0 ⇒ no fire).
+      peakPrice: this.peakPrice.get(position.id) ?? entryPrice,
+      status: position.status,
+      slPct: parseFloat(position.stopLossPct),
+      tpPct: parseFloat(position.takeProfitPct),
+      sellPctAtTp: env.SELL_PCT_AT_TP,
+      trailingStopPct: env.TRAILING_STOP_PCT,
+      trailingArmPct: env.TRAILING_ARM_PCT,
+    })
   }
 
   /** Entry-time reserves snapshot as a PairState — last-resort fill state. */

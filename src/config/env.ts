@@ -21,9 +21,20 @@ const envSchema = z.object({
   // ── Trade parameters ─────────────────────────────────────────────────────────
   TRADE_SIZE_NATIVE: z.coerce.number().positive().default(0.05),
   TAKE_PROFIT_PCT: z.coerce.number().positive().default(100),
-  // Safety policy: full exit at take-profit (no moonbag) — see PositionManager.decide()
+  /**
+   * % of the position sold when TP hits (de-risk). <100 leaves a moonbag that
+   * the trailing stop manages. Read from env at RUNTIME by the exit policy
+   * (not from the per-position snapshot) so it can be tuned with open positions.
+   */
   SELL_PCT_AT_TP: z.coerce.number().positive().max(100).default(100),
   STOP_LOSS_PCT: z.coerce.number().positive().default(50),
+  /**
+   * Trailing stop: drawdown-from-peak % that triggers a full exit of the
+   * remainder. 0 disables trailing (moonbag rides until SL/dev-sell/manual).
+   */
+  TRAILING_STOP_PCT: z.coerce.number().min(0).max(99).default(30),
+  /** Trailing stop arms only once the PEAK pnl% over entry reaches this. */
+  TRAILING_ARM_PCT: z.coerce.number().nonnegative().default(100),
   MAX_OPEN_POSITIONS: z.coerce.number().int().positive().default(5),
   DAILY_LOSS_LIMIT_NATIVE: z.coerce.number().positive().default(0.5),
   /**

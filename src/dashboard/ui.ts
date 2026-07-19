@@ -310,7 +310,10 @@ async function refreshStats() {
     document.getElementById('uptime').textContent = status.uptimeHuman
     document.getElementById('modeline').textContent =
       status.mode + ' · ' + status.nodeEnv +
-      ' · TP +' + status.takeProfitPct + '% / SL -' + status.stopLossPct + '%' +
+      ' · TP +' + status.takeProfitPct + '%' +
+      (status.sellPctAtTp && status.sellPctAtTp < 100 ? ' (sell ' + status.sellPctAtTp + '%)' : '') +
+      ' / SL -' + status.stopLossPct + '%' +
+      (status.trailingStopPct > 0 ? ' · Trail ' + status.trailingStopPct + '%@+' + status.trailingArmPct + '%' : '') +
       ' · MC min $' + (status.minEntryMcUsd ?? 0) +
       (status.ethUsd ? ' · ETH $' + status.ethUsd.toFixed(2) : '')
   }
@@ -709,7 +712,11 @@ async function refreshStats() {
 
     document.getElementById('uptime').textContent = status.uptimeHuman
     document.getElementById('trade-size').textContent = fmtEth(status.tradeSizeNative) + ' ETH'
-    document.getElementById('trade-size-sub').textContent = 'TP +' + status.takeProfitPct + '% / SL -' + status.stopLossPct + '%'
+    document.getElementById('trade-size-sub').textContent =
+      'TP +' + status.takeProfitPct + '%' +
+      (status.sellPctAtTp && status.sellPctAtTp < 100 ? ' (sell ' + status.sellPctAtTp + '%)' : '') +
+      ' / SL -' + status.stopLossPct + '%' +
+      (status.trailingStopPct > 0 ? ' · Trail ' + status.trailingStopPct + '%@+' + status.trailingArmPct + '%' : '')
 
     const allTimePnLEl = document.getElementById('alltime-pnl')
     if (status.allTimePaperPnl !== undefined) {
@@ -728,7 +735,10 @@ async function refreshStats() {
 
     document.getElementById('modeline').textContent =
       '📊 PAPER · ' + status.nodeEnv +
-      ' · TP +' + status.takeProfitPct + '% / SL -' + status.stopLossPct + '%' +
+      ' · TP +' + status.takeProfitPct + '%' +
+      (status.sellPctAtTp && status.sellPctAtTp < 100 ? ' (sell ' + status.sellPctAtTp + '%)' : '') +
+      ' / SL -' + status.stopLossPct + '%' +
+      (status.trailingStopPct > 0 ? ' · Trail ' + status.trailingStopPct + '%@+' + status.trailingArmPct + '%' : '') +
       ' · MC min $' + (status.minEntryMcUsd ?? 0) +
       (status.ethUsd ? ' · ETH $' + status.ethUsd.toFixed(2) : '')
 
