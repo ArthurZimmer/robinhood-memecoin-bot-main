@@ -176,8 +176,10 @@ export class UniswapPairParser {
       poolAddress: pair,
       tokenAddress: memecoinAddress,
       quoteTokenAddress: NATIVE_ETH_ADDRESS,
+      // Fallback: the token's own address (unique per launch) — token0 could be
+      // WETH, which would poison deployer-burst tracking and the blacklist.
       deployerAddress:
-        typeof payload['deployer'] === 'string' ? payload['deployer'] : token0,
+        typeof payload['deployer'] === 'string' ? payload['deployer'] : memecoinAddress,
       token0,
       token1,
       ...(typeof allPairsLength === 'number' && { allPairsLength }),

@@ -19,6 +19,7 @@ import {
   getRawPairInfo,
   getRawPairReserves,
   normalizeReserves,
+  quoteSell,
   type PairState,
 } from '../executor/uniswap-math.js'
 import { WETH_ADDRESS } from '../utils/robbinhood.utils.js'
@@ -249,6 +250,9 @@ export class DashboardServer {
       uptimeMs,
       uptimeHuman: humanDuration(uptimeMs),
       nodeEnv: env.NODE_ENV,
+      // Real mode: the monitored wallet address, so the operator can verify
+      // every dashboard number against the explorer.
+      walletAddress: env.TRADING_MODE === 'real' ? getBotAddress() : null,
       walletBalanceNative,
       walletBalanceUsd: ethUsd > 0 ? walletBalanceNative * ethUsd : null,
       paperBalanceNative: env.PAPER_BALANCE_NATIVE,
@@ -302,14 +306,44 @@ export class DashboardServer {
       const isEstimated = snap === undefined
       const spot = snap?.spotPriceNative ?? (isEstimated ? entry : undefined)
       const pnlPct = snap?.pnlPct ?? null // no false PnL when estimated
-      const unrealizedPnlNative =
-        spot !== undefined && !isEstimated && row.tokensReceived
-          ? (spot - entry) * (Number(BigInt(row.tokensReceived)) / 1e6)
-          : null
+
+      // Token decimals come from position metadata (stamped at entry). The old
+      // hardcoded 1e6 was a Solana leftover — with 18-decimals ERC-20s it
+      // inflated unrealized PnL by 10^12.
+      const meta = row.metadata as {
+        totalSupply?: string
+        tokenDecimals?: number
+        gasSpentNative?: number
+        honeypotProbe?: { sellTaxPct?: number }
+      } | null
+      const tokenDecimals = meta?.tokenDecimals ?? 18
+
+      // Unrealized PnL = what a 100% exit through the pool would realize RIGHT
+      // NOW (AMM impact + 0.3% fee + measured sell tax + entry gas) — the same
+      // formula realized PnL uses, not an optimistic mid-price mark.
+      let unrealizedPnlNative: number | null = null
+      if (snap && snap.ethReserve > 0 && snap.tokenReserve > 0 && row.tokensReceived) {
+        try {
+          const tokensWhole = Number(BigInt(row.tokensReceived)) / 10 ** tokenDecimals
+          const q = quoteSell(
+            { ethReserve: snap.ethReserve, tokenReserve: snap.tokenReserve, tokenDecimals },
+            tokensWhole,
+          )
+          const sellTaxPct = meta?.honeypotProbe?.sellTaxPct ?? 0
+          const buyGasNative = meta?.gasSpentNative ?? 0
+          unrealizedPnlNative =
+            q.nativeOut * (1 - sellTaxPct / 100) -
+            parseFloat(row.entryAmountNative) -
+            buyGasNative
+        } catch {
+          unrealizedPnlNative = null
+        }
+      }
 
       // Market cap = price × total supply. Total supply stored in position metadata.
-      const meta = row.metadata as { totalSupply?: string } | null
-      const totalSupplyNum = meta?.totalSupply ? Number(meta.totalSupply) / 1e18 : null
+      const totalSupplyNum = meta?.totalSupply
+        ? Number(meta.totalSupply) / 10 ** tokenDecimals
+        : null
       const entryMarketCapNative = totalSupplyNum !== null ? entry * totalSupplyNum : null
       const currentMarketCapNative =
         spot !== undefined && totalSupplyNum !== null ? spot * totalSupplyNum : null
@@ -325,6 +359,7 @@ export class DashboardServer {
         protocol: row.protocol,
         status: row.status,
         isMoonbag: row.isMoonbag,
+        entryTxHash: row.entryTxHash,
         entryAmountNative: parseFloat(row.entryAmountNative),
         entryPriceNative: entry,
         spotPriceNative: spot ?? null,
@@ -357,9 +392,16 @@ export class DashboardServer {
       tokenSymbol: row.tokenSymbol,
       tokenAddress: row.tokenAddress,
       status: row.status,
+      entryTxHash: row.entryTxHash,
+      exitTxHash: row.exitTxHash,
       entryAmountNative: parseFloat(row.entryAmountNative),
       exitAmountNative: parseFloat(row.exitAmountNative ?? '0'),
       realizedPnlNative: parseFloat(row.realizedPnlNative ?? '0'),
+      // Total gas (buy + sell) — exact by construction: realized = exit − entry − gas
+      gasNative:
+        parseFloat(row.exitAmountNative ?? '0') -
+        parseFloat(row.entryAmountNative) -
+        parseFloat(row.realizedPnlNative ?? '0'),
       pnlPct: (() => {
         const e = parseFloat(row.entryAmountNative)
         const r = parseFloat(row.realizedPnlNative ?? '0')
@@ -549,12 +591,15 @@ export class DashboardServer {
       }
     } catch {
       const meta = position.metadata as
-        | { pairReservesSnapshot?: { ethReserve?: number; tokenReserve?: number } }
+        | {
+            pairReservesSnapshot?: { ethReserve?: number; tokenReserve?: number }
+            tokenDecimals?: number
+          }
         | null
       pairState = {
         ethReserve: meta?.pairReservesSnapshot?.ethReserve ?? 0,
         tokenReserve: meta?.pairReservesSnapshot?.tokenReserve ?? 0,
-        tokenDecimals: 18,
+        tokenDecimals: meta?.tokenDecimals ?? 18,
       }
     }
 

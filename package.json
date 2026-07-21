@@ -20,9 +20,7 @@
     "funnel": "node scripts/funnel.mjs",
     "stop": "pkill -f 'src/main.ts' || true",
     "restart": "npm run stop; sleep 2; nohup npm run dev > /tmp/bot-run.log 2>&1 & echo 'bot reiniciado em background — logs: /tmp/bot-run.log'",
-    "test": "node --experimental-vm-modules node_modules/.bin/jest",
-    "test:unit": "jest tests/unit",
-    "test:integration": "jest tests/integration"
+    "test": "tsx --test tests/unit/*.test.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

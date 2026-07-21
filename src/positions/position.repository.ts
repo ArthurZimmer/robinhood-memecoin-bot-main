@@ -47,6 +47,32 @@ export async function todayRealizedPnlNative(mode: 'paper' | 'real'): Promise<nu
   return row ? parseFloat(row.total) : 0
 }
 
+/**
+ * Counts positions with this symbol closed IN PROFIT within the lookback
+ * window. Rug factories relaunch the ticker of a token that just pumped
+ * (often one we took profit on) and pull the LP minutes later — a recent
+ * profitable close on the same symbol marks the relaunch as bait.
+ */
+export async function countRecentProfitableClosesBySymbol(
+  mode: 'paper' | 'real',
+  symbol: string,
+  sinceMs: number,
+): Promise<number> {
+  const since = new Date(Date.now() - sinceMs)
+  const [row] = await db
+    .select({ n: count() })
+    .from(positions)
+    .where(
+      and(
+        eq(positions.mode, mode),
+        eq(positions.tokenSymbol, symbol),
+        gte(positions.closedAt, since),
+        sql`${positions.realizedPnlNative}::numeric > 0`,
+      ),
+    )
+  return row?.n ?? 0
+}
+
 export async function findPositionById(id: string): Promise<Position | null> {
   const [row] = await db.select().from(positions).where(eq(positions.id, id)).limit(1)
   return row ?? null

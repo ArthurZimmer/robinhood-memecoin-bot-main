@@ -19,6 +19,7 @@ import {
 } from '../analysis/token-analyzer.js'
 import {
   countOpenPositions,
+  countRecentProfitableClosesBySymbol,
   todayRealizedPnlNative,
 } from '../positions/position.repository.js'
 import {
@@ -29,6 +30,7 @@ import {
 } from '../events/event-types.js'
 import { probeToken, passesHoneypotGate } from '../risk/honeypot-probe.js'
 import { scanTokenCapabilities } from '../risk/capability-scan.js'
+import { checkLpConcentration } from '../risk/lp-guard.js'
 import type { BaseStrategy } from './base.strategy.js'
 import type { BaseExecutor } from '../executor/base.executor.js'
 
@@ -213,6 +215,30 @@ export class UniswapSnipeStrategy implements BaseStrategy {
     // ── Token age gate ───────────────────────────────────────────────────────
     const source = opp.sourceEvent as PoolCreatedEvent
     const tokenAgeMs = Date.now() - (source.timestamp ?? opp.timestamp)
+
+    // ── Anti-copycat gate ────────────────────────────────────────────────────
+    // Rug factories relaunch the ticker of a token that just pumped (often one
+    // we took profit on minutes earlier) and pull the LP ~20min in. A recent
+    // profitable close on the same symbol marks this launch as bait.
+    const candidateSymbol = source.tokenMetadata?.symbol
+    if (candidateSymbol && env.COPYCAT_SYMBOL_COOLDOWN_MIN > 0) {
+      const recentWins = await countRecentProfitableClosesBySymbol(
+        this.executor.mode,
+        candidateSymbol,
+        env.COPYCAT_SYMBOL_COOLDOWN_MIN * 60_000,
+      )
+      if (recentWins > 0) {
+        log.warn(
+          {
+            tokenAddress: opp.tokenAddress,
+            symbol: candidateSymbol,
+            cooldownMin: env.COPYCAT_SYMBOL_COOLDOWN_MIN,
+          },
+          'Copycat symbol relaunch — skip',
+        )
+        return null
+      }
+    }
     if (tokenAgeMs < env.MIN_TOKEN_AGE_MS) {
       log.debug(
         { tokenAddress: opp.tokenAddress, tokenAgeMs, min: env.MIN_TOKEN_AGE_MS },
@@ -321,6 +347,24 @@ export class UniswapSnipeStrategy implements BaseStrategy {
           error: capabilities.error,
         },
         'ENTRY REJECTED — sell-blocking capabilities with live owner',
+      )
+      return null
+    }
+
+    // ── LP-pull guard ────────────────────────────────────────────────────────
+    // Legit launches on this chain burn 100% of the LP at creation; the rug
+    // factory keeps ~100% and drains the pool ~19.5min in. Deployer holding
+    // LP is the root capability behind every LP-pull loss we recorded.
+    const lpGuard = await checkLpConcentration(opp.poolAddress, opp.deployerAddress)
+    if (!lpGuard.ok) {
+      log.warn(
+        {
+          tokenAddress: opp.tokenAddress,
+          symbol: source.tokenMetadata?.symbol ?? '?',
+          poolAddress: opp.poolAddress,
+          detail: lpGuard.detail,
+        },
+        'ENTRY REJECTED — LP concentration (LP-pull risk)',
       )
       return null
     }

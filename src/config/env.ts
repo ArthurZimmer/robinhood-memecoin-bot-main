@@ -26,6 +26,18 @@ const envSchema = z.object({
   STOP_LOSS_PCT: z.coerce.number().positive().default(50),
   MAX_OPEN_POSITIONS: z.coerce.number().int().positive().default(5),
   DAILY_LOSS_LIMIT_NATIVE: z.coerce.number().positive().default(0.5),
+  /**
+   * Anti-copycat: skip a candidate whose symbol matches a position closed IN
+   * PROFIT within this window (minutes). Rug factories relaunch just-pumped
+   * tickers and pull the LP minutes later. 0 disables the gate.
+   */
+  COPYCAT_SYMBOL_COOLDOWN_MIN: z.coerce.number().nonnegative().default(1_440),
+  /**
+   * LP-pull guard: reject entry when the deployer holds more than this % of
+   * the pair's LP tokens. Legit launches on this chain burn 100% of LP at
+   * creation; holding LP is what makes a one-tx pool drain possible.
+   */
+  LP_MAX_DEPLOYER_PCT: z.coerce.number().nonnegative().default(20),
 
   // ── Multi-tier entry filter ──────────────────────────────────────────────────
   /** Absolute floor market cap (USD). Tokens below this are ALWAYS rejected. */
@@ -70,8 +82,6 @@ const envSchema = z.object({
   MIN_TOKEN_AGE_MS: z.coerce.number().int().nonnegative().default(3_000),
   /** Minimum dev buy (ETH) for deployer commitment — overrides detector's default. */
   MIN_DEV_BUY_NATIVE: z.coerce.number().nonnegative().default(0.05),
-  /** Absolute floor wallet balance (ETH). Refuse trades if wallet drops below this. */
-  MIN_WALLET_BALANCE_NATIVE: z.coerce.number().nonnegative().default(0.1),
   /** Percentage of initial tokens the dev can sell before we abandon the position (rug-pull guard). */
   DEV_SELL_ABANDON_PCT: z.coerce.number().positive().max(100).default(10),
 

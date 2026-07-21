@@ -139,12 +139,13 @@ export const dashboardHtmlReal = /* html */ `<!DOCTYPE html>
         <th>Entry MC</th>
         <th>Current MC</th>
         <th>PnL %</th>
-        <th>Unrealized</th>
+        <th title="ETH que uma saída de 100% realizaria agora (impacto + fee + tax + gas de entrada)">Exit now (est)</th>
+        <th>Entry Tx</th>
         <th>Age</th>
         <th></th>
       </tr>
     </thead>
-    <tbody id="open-rows"><tr><td colspan="7" class="empty">No open positions</td></tr></tbody>
+    <tbody id="open-rows"><tr><td colspan="8" class="empty">No open positions</td></tr></tbody>
   </table>
 </section>
 
@@ -159,12 +160,14 @@ export const dashboardHtmlReal = /* html */ `<!DOCTYPE html>
         <th>Token</th>
         <th>Status</th>
         <th>In / Out</th>
+        <th title="Gas total (compra + venda) — derivado exato: saída − entrada − PnL">Gas</th>
         <th>PnL</th>
         <th>PnL %</th>
         <th>Duration</th>
+        <th>Exit Tx</th>
       </tr>
     </thead>
-    <tbody id="closed-rows"><tr><td colspan="6" class="empty">Nothing closed yet</td></tr></tbody>
+    <tbody id="closed-rows"><tr><td colspan="8" class="empty">Nothing closed yet</td></tr></tbody>
   </table>
 </section>
 
@@ -213,6 +216,12 @@ function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s
 }
 function explorer(addr) { return 'https://explorer.robinhoodchain.com/address/' + addr }
+function explorerTx(h) { return 'https://explorer.robinhoodchain.com/tx/' + h }
+// Real hashes only — synthetic markers (recovered:, honeypot:) get no link
+function txLink(h) {
+  if (!h || !h.startsWith('0x')) return '<span class="dim">—</span>'
+  return '<a href="' + explorerTx(h) + '" target="_blank" title="' + h + '">' + h.slice(0, 8) + '…↗</a>'
+}
 
 async function load(url) {
   try {
@@ -239,7 +248,7 @@ async function refreshPositions() {
     document.getElementById('open-sub').textContent = 'cap ' + maxOpen
     const tbody = document.getElementById('open-rows')
     if (open.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="7" class="empty">No open positions</td></tr>'
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">No open positions</td></tr>'
     } else {
       tbody.innerHTML = open.map(p => {
         const sym = p.tokenSymbol || truncate(p.tokenAddress, 10)
@@ -252,6 +261,7 @@ async function refreshPositions() {
           '<td class="mono">' + estMC + '</td>' +
           '<td class="mono ' + pnlClass(p.pnlPct) + '">' + fmtPct(p.pnlPct) + '</td>' +
           '<td class="mono ' + pnlClass(p.unrealizedPnlNative) + '">' + fmtEth(p.unrealizedPnlNative) + ' ETH</td>' +
+          '<td class="mono">' + txLink(p.entryTxHash) + '</td>' +
           '<td class="dim">' + fmtAge(p.ageMs) + '</td>' +
           '<td><button class="sell-btn" onclick="sellPosition(\\'' + p.id + '\\',this)">SELL</button></td>' +
         '</tr>'
@@ -263,7 +273,7 @@ async function refreshPositions() {
   if (closed) {
     const tbody = document.getElementById('closed-rows')
     if (closed.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty">Nothing closed yet</td></tr>'
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">Nothing closed yet</td></tr>'
     } else {
       tbody.innerHTML = closed.map(p => {
         const sym = p.tokenSymbol || truncate(p.tokenAddress, 10)
@@ -271,9 +281,11 @@ async function refreshPositions() {
           '<td><a href="' + explorer(p.tokenAddress) + '" target="_blank">' + sym + '</a></td>' +
           '<td><span class="badge ' + p.status + '">' + p.status + '</span></td>' +
           '<td class="mono dim">' + fmtEth(p.entryAmountNative) + ' / ' + fmtEth(p.exitAmountNative) + '</td>' +
+          '<td class="mono dim">' + fmtEth(p.gasNative) + '</td>' +
           '<td class="mono ' + pnlClass(p.realizedPnlNative) + '">' + fmtEth(p.realizedPnlNative) + ' ETH</td>' +
           '<td class="mono ' + pnlClass(p.pnlPct) + '">' + fmtPct(p.pnlPct) + '</td>' +
           '<td class="dim">' + fmtAge(p.durationMs) + '</td>' +
+          '<td class="mono">' + txLink(p.exitTxHash || p.entryTxHash) + '</td>' +
         '</tr>'
       }).join('')
     }
@@ -293,7 +305,8 @@ async function refreshStats() {
     const walletStr = walletUsd ? '$' + walletUsd.toFixed(2) : fmtEth(status.walletBalanceNative) + ' ETH'
     document.getElementById('wallet').textContent = walletStr
     document.getElementById('wallet-sub').textContent =
-      fmtEth(status.walletBalanceNative) + ' ETH · ' + status.mode + ' · trade ' + fmtEth(status.tradeSizeNative) + ' ETH'
+      fmtEth(status.walletBalanceNative) + ' ETH · ' + status.mode + ' · trade ' + fmtEth(status.tradeSizeNative) + ' ETH' +
+      (status.walletAddress ? ' · ' + status.walletAddress.slice(0, 6) + '…' + status.walletAddress.slice(-4) : '')
     document.getElementById('uptime').textContent = status.uptimeHuman
     document.getElementById('modeline').textContent =
       status.mode + ' · ' + status.nodeEnv +
