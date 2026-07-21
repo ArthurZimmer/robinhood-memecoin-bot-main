@@ -82,8 +82,6 @@ const envSchema = z.object({
   MIN_TOKEN_AGE_MS: z.coerce.number().int().nonnegative().default(3_000),
   /** Minimum dev buy (ETH) for deployer commitment — overrides detector's default. */
   MIN_DEV_BUY_NATIVE: z.coerce.number().nonnegative().default(0.05),
-  /** Absolute floor wallet balance (ETH). Refuse trades if wallet drops below this. */
-  MIN_WALLET_BALANCE_NATIVE: z.coerce.number().nonnegative().default(0.1),
   /** Percentage of initial tokens the dev can sell before we abandon the position (rug-pull guard). */
   DEV_SELL_ABANDON_PCT: z.coerce.number().positive().max(100).default(10),
 

@@ -291,14 +291,14 @@ export class RealExecutor implements BaseExecutor {
       const balanceWei = await rhProvider.getBalance(wallet.address)
       const balanceEth = Number(balanceWei) / 1e18
       const costEth = signal.amountNative
-      const minBalanceEth = env.MIN_WALLET_BALANCE_NATIVE + MIN_ETH_RESERVE
+      const minBalanceEth = MIN_ETH_RESERVE
 
       if (balanceEth < minBalanceEth + costEth) {
         return this.fail(
           startedAt,
           `insufficient wallet balance: have ${balanceEth.toFixed(4)} ETH, ` +
             `need ${(minBalanceEth + costEth).toFixed(4)} ETH ` +
-            `(floor ${env.MIN_WALLET_BALANCE_NATIVE} + trade ${costEth} + reserve)`,
+            `(trade ${costEth} + gas reserve ${MIN_ETH_RESERVE})`,
         )
       }
 
