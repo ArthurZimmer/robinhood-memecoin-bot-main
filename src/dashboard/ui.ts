@@ -111,7 +111,7 @@ export const dashboardHtmlReal = /* html */ `<!DOCTYPE html>
     <div class="metric-sub" id="wallet-sub">—</div>
   </div>
   <div class="metric">
-    <div class="metric-label">PnL today</div>
+    <div class="metric-label">PnL total</div>
     <div class="metric-value mono" id="pnl">—</div>
     <div class="metric-sub" id="pnl-sub">—</div>
   </div>
@@ -215,8 +215,8 @@ function truncate(s, n) {
   if (!s) return '—'
   return s.length > n ? s.slice(0, n) + '…' : s
 }
-function explorer(addr) { return 'https://explorer.robinhoodchain.com/address/' + addr }
-function explorerTx(h) { return 'https://explorer.robinhoodchain.com/tx/' + h }
+function explorer(addr) { return 'https://robinhoodchain.blockscout.com/address/' + addr }
+function explorerTx(h) { return 'https://robinhoodchain.blockscout.com/tx/' + h }
 // Real hashes only — synthetic markers (recovered:, honeypot:) get no link
 function txLink(h) {
   if (!h || !h.startsWith('0x')) return '<span class="dim">—</span>'
@@ -502,7 +502,7 @@ export const dashboardHtmlPaper = /* html */ `<!DOCTYPE html>
     <div class="metric-sub" id="wallet-sub">—</div>
   </div>
   <div class="metric">
-    <div class="metric-label">Sim PnL Today</div>
+    <div class="metric-label">Sim PnL total</div>
     <div class="metric-value mono" id="pnl">—</div>
     <div class="metric-sub" id="pnl-sub">—</div>
   </div>
@@ -625,7 +625,7 @@ function truncate(s, n) {
   if (!s) return '—'
   return s.length > n ? s.slice(0, n) + '…' : s
 }
-function explorer(addr) { return 'https://explorer.robinhoodchain.com/address/' + addr }
+function explorer(addr) { return 'https://robinhoodchain.blockscout.com/address/' + addr }
 
 async function load(url) {
   try {
