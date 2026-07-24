@@ -453,16 +453,15 @@ export class DashboardServer {
       .from(riskEvaluations)
       .where(sql`${riskEvaluations.evaluatedAt} >= ${startOfDay}`)
 
-    // Count buys/sells from positions table — works for both paper and real mode.
+    // Buys/sells and PnL are ALL-TIME (headline card shows historical, not daily).
+    // Risk counts above stay scoped to today.
     const tradeRows = await db
       .select({
         buys: sql<string>`COALESCE(COUNT(*), 0)`,
         sells: sql<string>`COALESCE(SUM(CASE WHEN closed_at IS NOT NULL THEN 1 ELSE 0 END), 0)`,
       })
       .from(positions)
-      .where(
-        sql`${positions.mode} = ${env.TRADING_MODE} AND ${positions.openedAt} >= ${startOfDay}`,
-      )
+      .where(sql`${positions.mode} = ${env.TRADING_MODE}`)
 
     const pnlRows = await db
       .select({
@@ -470,7 +469,7 @@ export class DashboardServer {
       })
       .from(positions)
       .where(
-        sql`${positions.mode} = ${env.TRADING_MODE} AND ${positions.closedAt} >= ${startOfDay}`,
+        sql`${positions.mode} = ${env.TRADING_MODE} AND ${positions.closedAt} IS NOT NULL`,
       )
 
     return {

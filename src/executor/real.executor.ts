@@ -801,9 +801,16 @@ export class RealExecutor implements BaseExecutor {
         const slippagePct = SELL_SLIPPAGE_PCT_BY_REASON[req.reason]
         const minEthOutWei = (expectedEthOutWei * BigInt(100 - slippagePct)) / 100n
 
-        // Build tx overrides with escalating priority fees
+        // Build tx overrides with escalating priority fees.
+        // EIP-1559 requires maxFeePerGas >= maxPriorityFeePerGas. Robinhood Chain's
+        // base fee is tiny (~0.18 gwei), so ethers' auto-filled maxFeePerGas sits
+        // below our escalated priority fee and rejects the tx pre-broadcast
+        // ("priorityFee cannot be more than maxFee") — set both explicitly.
+        const priorityFeeWei = priorityFeeGwei * 1_000_000_000n
+        const baseFeeWei = (await rhProvider.getBlock('latest'))?.baseFeePerGas ?? 0n
         const txOverrides: Record<string, unknown> = {
-          maxPriorityFeePerGas: priorityFeeGwei * 1_000_000_000n,
+          maxPriorityFeePerGas: priorityFeeWei,
+          maxFeePerGas: baseFeeWei * 2n + priorityFeeWei,
           gasLimit: 300_000n, // generous limit for swapExactTokensForETHSupportingFeeOnTransferTokens
         }
 
