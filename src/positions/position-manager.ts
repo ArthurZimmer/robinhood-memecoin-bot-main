@@ -89,6 +89,15 @@ export interface LivePositionSnapshot {
   fetchedAt: number
 }
 
+/**
+ * Consecutive failed real-sell attempts (executor reverts) before a position is
+ * written off as an unsellable honeypot. The sell simulation (probeToken) can be
+ * fooled by honeypots that only block the real tx, so we also give up based on
+ * observed real-sell reverts. Legit tokens fill within 1-2 retries; a stuck
+ * honeypot reverts every cycle (RobbingHood burned 157 reverts before this).
+ */
+const MAX_CONSECUTIVE_SELL_FAILURES = 6
+
 export class PositionManager {
   private timer: NodeJS.Timeout | null = null
   private running = false
@@ -97,6 +106,7 @@ export class PositionManager {
   private readonly staleKillAgeMs: number
   private readonly staleEthReserveToleranceNative: number
   private readonly inflight = new Set<string>()
+  private readonly sellFailures = new Map<string, number>()
   private lastRpcCheckAt = 0
 
   // Latest PnL snapshot per position — read by dashboard server
@@ -526,6 +536,7 @@ export class PositionManager {
     this.positionCache.delete(positionId)
     this.snapshots.delete(positionId)
     this.pairInfoCache.delete(positionId)
+    this.sellFailures.delete(positionId)
     this.devWalletMonitor.unwatch(positionId)
     wsManager.unregister(this.syncKey(positionId))
     log.debug({ positionId }, 'Unsubscribed closed position')
@@ -561,6 +572,7 @@ export class PositionManager {
       }
 
       if (result.success) {
+        this.sellFailures.delete(position.id)
         log.info(
           {
             positionId: position.id,
@@ -579,9 +591,35 @@ export class PositionManager {
         }
       } else {
         log.warn({ positionId: position.id, error: result.error }, 'Executor rejected sell')
+        await this.recordSellFailure(position)
       }
     } finally {
       this.inflight.delete(position.id)
+    }
+  }
+
+  /**
+   * Count a failed real sell. After MAX_CONSECUTIVE_SELL_FAILURES the token is an
+   * unsellable honeypot the probe missed — write it off so it stops burning gas
+   * on doomed retries and frees the open-position slot (MAX_OPEN_POSITIONS).
+   * Only executor rejections count; transient throws (RPC blips) are excluded so
+   * a network outage can't write off a healthy position.
+   */
+  private async recordSellFailure(position: Position): Promise<void> {
+    const n = (this.sellFailures.get(position.id) ?? 0) + 1
+    this.sellFailures.set(position.id, n)
+    log.warn(
+      {
+        positionId: position.id,
+        tokenSymbol: position.tokenSymbol,
+        failures: n,
+        max: MAX_CONSECUTIVE_SELL_FAILURES,
+      },
+      'Real sell failed — counting toward honeypot write-off',
+    )
+    if (n >= MAX_CONSECUTIVE_SELL_FAILURES) {
+      this.sellFailures.delete(position.id)
+      await this.closeUnsellable(position)
     }
   }
 
