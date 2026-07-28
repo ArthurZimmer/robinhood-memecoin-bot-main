@@ -9,7 +9,8 @@ services:
       POSTGRES_DB: robinhood_bot
       PGDATA: /var/lib/postgresql/data/pgdata
     ports:
-      - "5432:5432"
+      # Localhost ONLY — the VPS has no firewall rule for 5432.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -31,7 +32,9 @@ services:
       --maxmemory-policy allkeys-lru
       --save 60 1
     ports:
-      - "6379:6379"
+      # Localhost ONLY — Redis runs without a password; public exposure would let
+      # anyone forge events:approved, poison cache:eth_usd or drop the buy locks.
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:

@@ -8,4 +8,7 @@ echo "[entrypoint] Applying database migrations..."
 npm run db:migrate
 
 echo "[entrypoint] Starting bot (mode from TRADING_MODE)..."
-exec npm run start
+# exec node directly, NOT `npm run start`: npm would be PID 1 and does not
+# forward SIGTERM to the node grandchild, so `docker stop` killed the process
+# without ever running main.ts's graceful shutdown (drain, DB flush).
+exec node dist/main.js
