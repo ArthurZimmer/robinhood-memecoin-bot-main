@@ -159,6 +159,13 @@ export interface TradeSignal {
   opportunity: ApprovedOpportunity
   /** Honeypot/tax probe result (present when the strategy ran a probe before buying). */
   honeypotProbe?: HoneypotProbeResult
+  /**
+   * Deployer's share of the pair's LP supply at entry, percent. Persisted so a
+   * post-mortem can tell whether the LP-pull guard was fooled or simply not the
+   * mechanism used — without it, a drained pool is indistinguishable from a
+   * token-level rug after the fact.
+   */
+  deployerLpPct?: number
 }
 
 // ── Position events (Position Manager → Notifications) ───────────────────────

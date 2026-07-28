@@ -389,6 +389,7 @@ export class UniswapSnipeStrategy implements BaseStrategy {
         sellTaxPct: probe.sellTaxPct,
         roundTripPct: probe.roundTripPct,
       },
+      ...(lpGuard.deployerLpPct !== null && { deployerLpPct: lpGuard.deployerLpPct }),
     }
 
     log.info(
@@ -403,6 +404,7 @@ export class UniswapSnipeStrategy implements BaseStrategy {
         compositeScore: analysis.compositeScore,
         buyTaxPct: probe.buyTaxPct.toFixed(2),
         sellTaxPct: probe.sellTaxPct.toFixed(2),
+        deployerLpPct: lpGuard.deployerLpPct?.toFixed(2) ?? 'unknown',
       },
       '✅ ENTRY APPROVED — emitting buy signal',
     )

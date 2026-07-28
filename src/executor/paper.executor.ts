@@ -265,6 +265,9 @@ export class PaperExecutor implements BaseExecutor {
           deployerAddress: signal.opportunity.deployerAddress,
           // Honeypot probe taxes — sell tax is read back at exit time.
           ...(signal.honeypotProbe && { honeypotProbe: signal.honeypotProbe }),
+          // LP-guard reading at entry — the only forensic record of it, since
+          // the pair's LP supply is rewritten by any later liquidity removal.
+          ...(signal.deployerLpPct !== undefined && { deployerLpPct: signal.deployerLpPct }),
         },
       })
 
