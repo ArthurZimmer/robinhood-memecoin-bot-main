@@ -93,8 +93,6 @@ const UNISWAP_V2_ROUTER_ABI = [
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/** Minimum ETH to leave in wallet (never spend entire balance). */
-const MIN_ETH_RESERVE = 0.005 // 0.005 ETH for gas
 /** Timeout for tx confirmation (ms). */
 const CONFIRM_TIMEOUT_MS = 60_000
 /**
@@ -117,6 +115,18 @@ const MAX_SELL_RETRIES = 3
 const SELL_RETRY_BACKOFF_MS = [500, 1_000, 2_000]
 /** Escalating priority fees per retry (gwei). Index 0 = first send. */
 const SELL_PRIORITY_FEES_GWEI = [2n, 5n, 10n]
+/** Gas limit for swapExactTokensForETHSupportingFeeOnTransferTokens. */
+const SELL_GAS_LIMIT = 300_000n
+
+/**
+ * ETH held back from entries so every open position can still pay for its own
+ * exit. Sized as (approve + swap) gas at the HIGHEST escalated priority fee,
+ * times the position cap — a wallet drained by entries cannot sell, which turns
+ * a recoverable drawdown into a total loss on every open position at once.
+ */
+const MIN_ETH_RESERVE =
+  (Number((APPROVE_GAS_LIMIT + SELL_GAS_LIMIT) * SELL_PRIORITY_FEES_GWEI.at(-1)!) / 1e9) *
+  env.MAX_OPEN_POSITIONS
 
 export type SellReason =
   | 'take-profit'
@@ -298,7 +308,8 @@ export class RealExecutor implements BaseExecutor {
           startedAt,
           `insufficient wallet balance: have ${balanceEth.toFixed(4)} ETH, ` +
             `need ${(minBalanceEth + costEth).toFixed(4)} ETH ` +
-            `(trade ${costEth} + gas reserve ${MIN_ETH_RESERVE})`,
+            `(trade ${costEth} + exit-gas reserve ${MIN_ETH_RESERVE.toFixed(4)} ` +
+            `for ${env.MAX_OPEN_POSITIONS} position(s))`,
         )
       }
 
@@ -507,6 +518,9 @@ export class RealExecutor implements BaseExecutor {
           // Honeypot probe taxes — persisted for audit (real fills already
           // reflect any on-chain tax, so no adjustment is applied here).
           ...(signal.honeypotProbe && { honeypotProbe: signal.honeypotProbe }),
+          // LP-guard reading at entry — the only forensic record of it, since
+          // the pair's LP supply is rewritten by any later liquidity removal.
+          ...(signal.deployerLpPct !== undefined && { deployerLpPct: signal.deployerLpPct }),
         },
       }))
 
@@ -811,7 +825,7 @@ export class RealExecutor implements BaseExecutor {
         const txOverrides: Record<string, unknown> = {
           maxPriorityFeePerGas: priorityFeeWei,
           maxFeePerGas: baseFeeWei * 2n + priorityFeeWei,
-          gasLimit: 300_000n, // generous limit for swapExactTokensForETHSupportingFeeOnTransferTokens
+          gasLimit: SELL_GAS_LIMIT,
         }
 
         const swapTx: TransactionResponse = await withTxLock(() =>
