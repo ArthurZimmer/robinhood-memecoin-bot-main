@@ -238,9 +238,17 @@ process.on('uncaughtException', (err) => {
   void shutdown('uncaughtException', 1)
 })
 
+// NOT fatal — unlike an uncaught exception, a stray rejection does not imply
+// corrupted in-process state, and every money path (executor, position manager)
+// already wraps its own awaits. Most rejections that reach here come from
+// ethers' socket layer: SocketSubscriber.start() stores the eth_subscribe
+// promise without a catch, so a provider rate-limit reply lands here with NO
+// way for the caller to intercept it — a `.catch()` on contract.on() cannot see
+// it. Exiting meant one throttled reconnect dropped TP/SL monitoring for every
+// open position and triggered a restart→resubscribe→throttle loop (observed
+// 2026-08-03: 8 restarts, 7 of them within 2.5 minutes). Log loudly, stay up.
 process.on('unhandledRejection', (reason) => {
-  log.fatal({ reason }, 'Unhandled rejection — shutting down')
-  void shutdown('unhandledRejection', 1)
+  log.error({ reason }, 'Unhandled rejection — logged, bot continues')
 })
 
 // ── Entry point ───────────────────────────────────────────────────────────────

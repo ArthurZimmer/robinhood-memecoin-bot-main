@@ -22,6 +22,13 @@ const PING_INTERVAL_MS = 30_000
 const PONG_TIMEOUT_MS = 10_000
 const RECONNECT_BASE_DELAY_MS = 1_000
 const RECONNECT_MAX_DELAY_MS = 15_000
+/**
+ * Gap between re-subscribes on (re)connect. Providers meter eth_subscribe
+ * against the same per-second budget as every other call, so firing the whole
+ * set in one tick competes with the pipeline's own RPC traffic and gets the
+ * subscribes rejected. Tune UP if the provider still throttles on reconnect.
+ */
+const SUBSCRIBE_STAGGER_MS = 100
 
 /** Structural type for the Node `ws` socket ethers wraps — avoids a direct dep on `ws`. */
 interface NodeWebSocketLike {
@@ -146,11 +153,29 @@ export class WsManager {
       this.handleDisconnect('socket closed')
     })
 
-    // Apply all registered subscriptions. ethers queues sends until the socket
-    // opens, so subscriptions land the instant the connection is established —
-    // no extra latency on the detection path.
+    // Re-apply registered subscriptions (staggered — see applyAllFactories).
+    // Empty on the FIRST connect: consumers register after wsManager.start(),
+    // and register() applies immediately, so startup pays no stagger delay.
+    void this.applyAllFactories(provider, isReconnect)
+  }
+
+  /**
+   * Re-apply every registered subscription, spaced by SUBSCRIBE_STAGGER_MS.
+   * Firing them in a single tick is what tripped the provider's per-second
+   * limit after a reconnect; the rejected eth_subscribe then surfaced as an
+   * unhandled rejection with no catchable call site (see main.ts).
+   */
+  private async applyAllFactories(
+    provider: WebSocketProvider,
+    isReconnect: boolean,
+  ): Promise<void> {
+    let first = true
     for (const [key, factory] of this.factories) {
-      void this.applyFactory(key, factory, provider, isReconnect)
+      // Socket died mid-loop — the next connect() re-applies from scratch.
+      if (this.currentProvider !== provider) return
+      if (!first) await new Promise((r) => setTimeout(r, SUBSCRIBE_STAGGER_MS))
+      first = false
+      await this.applyFactory(key, factory, provider, isReconnect)
     }
   }
 
