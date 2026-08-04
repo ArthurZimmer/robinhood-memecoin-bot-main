@@ -18,6 +18,7 @@ import {
   type TokenAnalysis,
 } from '../analysis/token-analyzer.js'
 import {
+  countPriorDeployerLaunches,
   countOpenPositions,
   countRecentProfitableClosesBySymbol,
   todayRealizedPnlNative,
@@ -239,6 +240,33 @@ export class UniswapSnipeStrategy implements BaseStrategy {
         return null
       }
     }
+    // ── Serial-deployer gate ─────────────────────────────────────────────────
+    // Runs BEFORE the pair snapshot and token analysis: it needs only the
+    // deployer address plus a local DB count, so rejecting here skips several
+    // RPC round trips. Applies to EVERY tier — the tier3-only freshness check
+    // below is scoped to low-MC launches and misses this band entirely.
+    if (env.DEPLOYER_REPEAT_MIN > 0) {
+      // +1 counts this candidate, matching how the study bucketed deployers.
+      const launches = 1 + await countPriorDeployerLaunches(
+        opp.deployerAddress,
+        opp.tokenAddress,
+        env.DEPLOYER_LOOKBACK_DAYS * 86_400_000,
+      )
+      if (launches >= env.DEPLOYER_REPEAT_MIN && launches <= env.DEPLOYER_REPEAT_MAX) {
+        log.info(
+          {
+            tokenAddress: opp.tokenAddress,
+            symbol: source.tokenMetadata?.symbol ?? '?',
+            deployer: opp.deployerAddress.slice(0, 12),
+            launches,
+            band: `${env.DEPLOYER_REPEAT_MIN}-${env.DEPLOYER_REPEAT_MAX}`,
+          },
+          'ENTRY REJECTED — deployer in serial-rug band',
+        )
+        return null
+      }
+    }
+
     if (tokenAgeMs < env.MIN_TOKEN_AGE_MS) {
       log.debug(
         { tokenAddress: opp.tokenAddress, tokenAgeMs, min: env.MIN_TOKEN_AGE_MS },
@@ -284,6 +312,26 @@ export class UniswapSnipeStrategy implements BaseStrategy {
 
     // ── Tier decision ──────────────────────────────────────────────────────────
     const { tier, reason: tierReason } = determineTier(snapshot.mcUsd)
+
+    // ── Market-cap dead band ─────────────────────────────────────────────────
+    // The one MC bucket that lost money across the whole study, and where the
+    // three real total losses were entered.
+    if (
+      env.MC_AVOID_MIN_USD > 0 &&
+      snapshot.mcUsd >= env.MC_AVOID_MIN_USD &&
+      snapshot.mcUsd < env.MC_AVOID_MAX_USD
+    ) {
+      log.info(
+        {
+          tokenAddress: opp.tokenAddress,
+          symbol: source.tokenMetadata?.symbol ?? '?',
+          mcUsd: snapshot.mcUsd,
+          band: `$${env.MC_AVOID_MIN_USD}-${env.MC_AVOID_MAX_USD}`,
+        },
+        'ENTRY REJECTED — market cap in negative-EV band',
+      )
+      return null
+    }
 
     if (tier === 'rejected') {
       log.info(

@@ -38,6 +38,25 @@ const envSchema = z.object({
    * creation; holding LP is what makes a one-tx pool drain possible.
    */
   LP_MAX_DEPLOYER_PCT: z.coerce.number().nonnegative().default(20),
+  /**
+   * Anti-serial-rug: reject a candidate whose deployer launched between
+   * DEPLOYER_REPEAT_MIN and DEPLOYER_REPEAT_MAX tokens within
+   * DEPLOYER_LOOKBACK_DAYS. Measured over 3810 launches: that band rugged 41.5%
+   * of the time and was the only deployer bucket with negative expected value,
+   * against 18.5% for first-timers and 6.1% for 10+ launch deployers — the
+   * chain's launch factories, the SAFEST group, which must not be caught here.
+   * Set DEPLOYER_REPEAT_MIN=0 to disable.
+   */
+  DEPLOYER_REPEAT_MIN: z.coerce.number().int().nonnegative().default(2),
+  DEPLOYER_REPEAT_MAX: z.coerce.number().int().nonnegative().default(3),
+  DEPLOYER_LOOKBACK_DAYS: z.coerce.number().int().positive().default(14),
+  /**
+   * Skip this market-cap band (USD) — the only MC bucket with negative expected
+   * value in the same study, and where all three real total losses were entered.
+   * Set MC_AVOID_MIN_USD=0 to disable.
+   */
+  MC_AVOID_MIN_USD: z.coerce.number().nonnegative().default(40_000),
+  MC_AVOID_MAX_USD: z.coerce.number().nonnegative().default(60_000),
 
   // ── Multi-tier entry filter ──────────────────────────────────────────────────
   /** Absolute floor market cap (USD). Tokens below this are ALWAYS rejected. */

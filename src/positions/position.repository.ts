@@ -1,8 +1,9 @@
-import { and, count, eq, gte, isNull, sql } from 'drizzle-orm'
+import { and, count, eq, gte, isNull, ne, sql } from 'drizzle-orm'
 import { db } from '../database/client.js'
 import {
   paperTrades,
   positions,
+  riskEvaluations,
   type NewPaperTrade,
   type NewPosition,
   type Position,
@@ -71,6 +72,32 @@ export async function countRecentProfitableClosesBySymbol(
       ),
     )
   return row?.n ?? 0
+}
+
+/**
+ * How many OTHER tokens this deployer launched within the lookback.
+ * The candidate itself is excluded on purpose: its own risk_evaluations row
+ * is written fire-and-forget, so including it would make the count race.
+ * Sourced from risk_evaluations (every candidate ever evaluated) rather than the
+ * Redis deployer counter, whose 1h TTL makes it a "launches this hour" gauge.
+ */
+export async function countPriorDeployerLaunches(
+  deployerAddress: string,
+  excludeTokenAddress: string,
+  sinceMs: number,
+): Promise<number> {
+  const since = new Date(Date.now() - sinceMs)
+  const [row] = await db
+    .select({ n: sql<string>`COUNT(DISTINCT ${riskEvaluations.tokenAddress})` })
+    .from(riskEvaluations)
+    .where(
+      and(
+        eq(riskEvaluations.deployerAddress, deployerAddress),
+        gte(riskEvaluations.evaluatedAt, since),
+        ne(riskEvaluations.tokenAddress, excludeTokenAddress),
+      ),
+    )
+  return row ? parseInt(row.n, 10) : 0
 }
 
 export async function findPositionById(id: string): Promise<Position | null> {
